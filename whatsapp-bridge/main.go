@@ -882,6 +882,24 @@ func extractTextContent(msg *waProto.Message) string {
 		return doc.GetCaption()
 	}
 
+	// Shared contact cards (vCard) — surface display name + TEL lines as text
+	// so they are stored and webhooked (otherwise empty content is skipped).
+	if c := msg.GetContactMessage(); c != nil {
+		return formatContactMessage(c)
+	}
+	if arr := msg.GetContactsArrayMessage(); arr != nil {
+		parts := make([]string, 0, len(arr.GetContacts())+1)
+		if n := strings.TrimSpace(arr.GetDisplayName()); n != "" {
+			parts = append(parts, n)
+		}
+		for _, c := range arr.GetContacts() {
+			if s := formatContactMessage(c); s != "" {
+				parts = append(parts, s)
+			}
+		}
+		return strings.Join(parts, "\n")
+	}
+
 	// WhatsApp Business templates arrive hydrated — body lives in
 	// HydratedTemplate.HydratedContentText. Without this branch every
 	// template-sent message (e.g. WABA Connect Hrms_* notifications)
@@ -1492,7 +1510,69 @@ func extractMediaInfo(msg *waProto.Message, msgTimestamp time.Time, msgID string
 			stk.GetURL(), stk.GetMediaKey(), stk.GetFileSHA256(), stk.GetFileEncSHA256(), stk.GetFileLength()
 	}
 
+	// Contact / vCard shares have no downloadable media URL; mark mediaType so
+	// storage + webhook still fire (content comes from extractTextContent).
+	if c := msg.GetContactMessage(); c != nil {
+		name := strings.TrimSpace(c.GetDisplayName())
+		if name == "" {
+			name = "contact"
+		}
+		safe := strings.Map(func(r rune) rune {
+			if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+				return r
+			}
+			if r == ' ' {
+				return '_'
+			}
+			return -1
+		}, name)
+		if safe == "" {
+			safe = "contact"
+		}
+		return "contact", safe + "_" + suffix + ".vcf", "", nil, nil, nil, 0
+	}
+	if arr := msg.GetContactsArrayMessage(); arr != nil {
+		return "contact", "contacts_" + suffix + ".vcf", "", nil, nil, nil, 0
+	}
+
 	return "", "", "", nil, nil, nil, 0
+}
+
+// formatContactMessage turns a WhatsApp contact share into a short searchable
+// summary: display name plus TEL lines from the embedded vCard.
+func formatContactMessage(c *waProto.ContactMessage) string {
+	if c == nil {
+		return ""
+	}
+	name := strings.TrimSpace(c.GetDisplayName())
+	vcard := c.GetVcard()
+	var tels []string
+	for _, line := range strings.Split(vcard, "\n") {
+		line = strings.TrimSpace(line)
+		upper := strings.ToUpper(line)
+		if strings.HasPrefix(upper, "TEL") {
+			// TEL;TYPE=CELL:+44... or TEL:+44...
+			if i := strings.Index(line, ":"); i >= 0 {
+				tel := strings.TrimSpace(line[i+1:])
+				if tel != "" {
+					tels = append(tels, tel)
+				}
+			}
+		}
+	}
+	switch {
+	case name != "" && len(tels) > 0:
+		return fmt.Sprintf("Contact: %s (%s)", name, strings.Join(tels, ", "))
+	case name != "":
+		return "Contact: " + name
+	case len(tels) > 0:
+		return "Contact: (" + strings.Join(tels, ", ") + ")"
+	default:
+		if strings.TrimSpace(vcard) != "" {
+			return "Contact: (vCard)"
+		}
+		return ""
+	}
 }
 
 // resolveLIDChat resolves a LID-based chat JID to its phone-based equivalent
@@ -1689,10 +1769,13 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	}
 
 	// For image messages, download media synchronously so we can include the base64
-	// payload in the webhook. Other media types (video, audio, document) are still
-	// downloaded asynchronously since they are not passed to the AI vision pipeline.
+	// payload in the webhook. Audio (PTT/voice notes) is also synced — voice notes
+	// are small and CursorPA needs a webhook wake with mediaType=audio.
+	// Other media types (video, document) are still downloaded asynchronously.
 	var imageDownloadPath string
 	var imageMimeType string
+	var audioDownloadPath string
+	var audioMimeType string
 	if mediaType == "image" && url != "" && len(mediaKey) > 0 {
 		logger.Infof("Downloading image media for message %s (synchronous)", msg.Info.ID)
 		success, _, _, dlPath, dlErr := downloadMedia(client, messageStore, msg.Info.ID, chatJID)
@@ -1718,8 +1801,21 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 				_, _, _, _, _ = downloadMedia(client, messageStore, msg.Info.ID, chatJID)
 			}()
 		}
-	} else if mediaType != "" && mediaType != "image" && url != "" && len(mediaKey) > 0 {
-		// Non-image media: async download for caching only (not sent to vision pipeline)
+	} else if mediaType == "audio" && url != "" && len(mediaKey) > 0 {
+		logger.Infof("Downloading audio media for message %s (synchronous, webhook wake)", msg.Info.ID)
+		success, _, _, dlPath, dlErr := downloadMedia(client, messageStore, msg.Info.ID, chatJID)
+		if success && dlErr == nil {
+			audioDownloadPath = dlPath
+			audioMimeType = "audio/ogg; codecs=opus"
+			logger.Infof("✅ Audio downloaded: %s", dlPath)
+		} else {
+			logger.Warnf("❌ Audio download failed: %v", dlErr)
+			go func() {
+				_, _, _, _, _ = downloadMedia(client, messageStore, msg.Info.ID, chatJID)
+			}()
+		}
+	} else if mediaType != "" && mediaType != "image" && mediaType != "audio" && url != "" && len(mediaKey) > 0 {
+		// Non-image/non-audio media: async download for caching only
 		logger.Infof("Auto-downloading %s media for message %s", mediaType, msg.Info.ID)
 		go func() {
 			success, _, _, downloadPath, err := downloadMedia(client, messageStore, msg.Info.ID, chatJID)
@@ -1733,18 +1829,33 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 
 	// Send webhook for incoming messages.
 	// Forward self-messages when FORWARD_SELF=true.
-	// Always forward image messages (even without a text caption) so the AI vision
-	// pipeline can analyse the image content.
+	// Always forward image and audio messages (even without a text caption) so
+	// vision / STT pipelines can run.
 	shouldForward := forwardSelfMessages || !msg.Info.IsFromMe
 	hasText := content != ""
 	hasImage := mediaType == "image"
+	hasAudio := mediaType == "audio"
+	hasContact := mediaType == "contact"
 
-	if shouldForward && (hasText || hasImage) {
+	if shouldForward && (hasText || hasImage || hasAudio || hasContact) {
 		if hasImage {
 			SendWebhookWithMedia(
 				sender, content, chatJID, msg.Info.IsFromMe,
 				quotedMessageId, quotedSender, quotedContent, quotedIsFromMe, mentionedJIDs,
 				msg.Info.ID, mediaType, imageMimeType, filename, imageDownloadPath,
+			)
+		} else if hasAudio {
+			// Prefer metadata + local path over huge base64 for voice notes.
+			SendWebhookWithMedia(
+				sender, content, chatJID, msg.Info.IsFromMe,
+				quotedMessageId, quotedSender, quotedContent, quotedIsFromMe, mentionedJIDs,
+				msg.Info.ID, mediaType, audioMimeType, filename, audioDownloadPath,
+			)
+		} else if hasContact {
+			SendWebhookWithMedia(
+				sender, content, chatJID, msg.Info.IsFromMe,
+				quotedMessageId, quotedSender, quotedContent, quotedIsFromMe, mentionedJIDs,
+				msg.Info.ID, mediaType, "text/vcard", filename, "",
 			)
 		} else {
 			SendWebhook(sender, content, chatJID, msg.Info.IsFromMe, quotedMessageId, quotedSender, quotedContent, quotedIsFromMe, mentionedJIDs)

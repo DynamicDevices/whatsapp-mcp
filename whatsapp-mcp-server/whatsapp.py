@@ -1155,6 +1155,51 @@ def send_reaction(
         return False, f"Unexpected error: {str(e)}"
 
 
+def mark_read(
+    chat_jid: str,
+    message_id: str = "",
+    message_ids: list[str] | None = None,
+    sender_jid: str = "",
+) -> tuple[bool, str]:
+    """Mark inbound WhatsApp message(s) as read (blue ticks).
+
+    Args:
+        chat_jid: Chat JID (DM phone JID or group @g.us).
+        message_id: Optional single message ID to mark.
+        message_ids: Optional list of message IDs (same sender).
+        sender_jid: Required for groups when IDs are provided; for DMs defaults to chat.
+
+    If neither message_id nor message_ids is set, the bridge marks recent inbound
+    messages for that chat from its local store.
+    """
+    try:
+        if not chat_jid:
+            return False, "chat_jid must be provided"
+
+        url = f"{WHATSAPP_API_BASE_URL}/mark_read"
+        payload: dict[str, Any] = {"chat_jid": chat_jid}
+        if message_id:
+            payload["message_id"] = message_id
+        if message_ids:
+            payload["message_ids"] = list(message_ids)
+        if sender_jid:
+            payload["sender_jid"] = sender_jid
+
+        response = requests.post(url, json=payload, headers=_bridge_headers())
+        if response.status_code == 200:
+            result = response.json()
+            if result.get("success"):
+                return True, result.get("message", "Marked read")
+            return False, result.get("message", "Unknown error")
+        return False, f"Error: HTTP {response.status_code} - {response.text}"
+    except requests.RequestException as e:
+        return False, f"Request error: {str(e)}"
+    except json.JSONDecodeError:
+        return False, f"Error parsing response: {response.text}"
+    except Exception as e:
+        return False, f"Unexpected error: {str(e)}"
+
+
 def download_media(message_id: str, chat_jid: str) -> str | None:
     """Download media from a message and return the local file path.
 

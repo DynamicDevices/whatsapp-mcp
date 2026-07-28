@@ -2712,3 +2712,52 @@ func TestSendHandler_MentionsField_PassedThrough(t *testing.T) {
 		t.Errorf("expected 400 for empty recipient with mentions field, got %d", resp.Code)
 	}
 }
+
+func TestMarkReadHandler_MissingChatJID_Returns400(t *testing.T) {
+	const token = "supersecrettoken1234567890abcdef"
+	handler := newRESTMux(newTestClient(&mockLIDStore{}), newTestMessageStore(t), 8080, token, nil)
+
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/api/mark_read",
+		strings.NewReader(`{"message_id":"3AABCDEF"}`))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for missing chat_jid, got %d body=%s", resp.Code, resp.Body.String())
+	}
+}
+
+func TestMarkReadHandler_NoAuth_Returns401(t *testing.T) {
+	const token = "supersecrettoken1234567890abcdef"
+	handler := newRESTMux(newTestClient(&mockLIDStore{}), newTestMessageStore(t), 8080, token, nil)
+
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/api/mark_read",
+		strings.NewReader(`{"chat_jid":"447478346120@s.whatsapp.net","message_id":"3AABCDEF"}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+	if resp.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 without auth, got %d", resp.Code)
+	}
+}
+
+func TestGetRecentInboundForMarkRead(t *testing.T) {
+	ms := newTestMessageStore(t)
+	chat := "447478346120@s.whatsapp.net"
+	_ = ms.StoreChat(chat, "Alex", time.Now())
+	_ = ms.StoreMessage("id-out", chat, "me", "hi", time.Now().Add(-2*time.Minute), true, "", "", "", nil, nil, nil, 0, "")
+	_ = ms.StoreMessage("id-in-1", chat, chat, "hey", time.Now().Add(-time.Minute), false, "", "", "", nil, nil, nil, 0, "")
+	_ = ms.StoreMessage("id-in-2", chat, chat, "again", time.Now(), false, "", "", "", nil, nil, nil, 0, "")
+
+	refs, err := ms.GetRecentInboundForMarkRead(chat, 10)
+	if err != nil {
+		t.Fatalf("GetRecentInboundForMarkRead: %v", err)
+	}
+	if len(refs) != 2 {
+		t.Fatalf("expected 2 inbound refs, got %d (%#v)", len(refs), refs)
+	}
+	if refs[0].ID != "id-in-2" || refs[1].ID != "id-in-1" {
+		t.Fatalf("unexpected order: %#v", refs)
+	}
+}

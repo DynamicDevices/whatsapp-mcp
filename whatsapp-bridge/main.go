@@ -766,6 +766,40 @@ func (store *MessageStore) GetMessages(chatJID string, limit int) ([]Message, er
 	return messages, nil
 }
 
+// InboundMessageRef is enough to send a MarkRead receipt for one stored message.
+type InboundMessageRef struct {
+	ID     string
+	Sender string
+}
+
+// GetRecentInboundForMarkRead returns recent inbound (not-from-me) message IDs
+// for a chat, newest first. Used when /api/mark_read is called without explicit IDs.
+func (store *MessageStore) GetRecentInboundForMarkRead(chatJID string, limit int) ([]InboundMessageRef, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	rows, err := store.db.Query(
+		`SELECT id, sender FROM messages
+		 WHERE chat_jid = ? AND is_from_me = 0 AND deleted_at IS NULL
+		 ORDER BY timestamp DESC LIMIT ?`,
+		chatJID, limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []InboundMessageRef
+	for rows.Next() {
+		var ref InboundMessageRef
+		if err := rows.Scan(&ref.ID, &ref.Sender); err != nil {
+			return nil, err
+		}
+		out = append(out, ref)
+	}
+	return out, rows.Err()
+}
+
 // Call storage methods.
 //
 // WhatsApp calls arrive as a sequence of events: Offer/OfferNotice → Accept →
@@ -1950,7 +1984,7 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 				msg.Info.ID, mediaType, "text/vcard", filename, "",
 			)
 		} else {
-			SendWebhook(sender, content, chatJID, msg.Info.IsFromMe, quotedMessageId, quotedSender, quotedContent, quotedIsFromMe, mentionedJIDs)
+			SendWebhook(sender, content, chatJID, msg.Info.IsFromMe, quotedMessageId, quotedSender, quotedContent, quotedIsFromMe, mentionedJIDs, msg.Info.ID)
 		}
 	}
 
@@ -1983,6 +2017,24 @@ type DownloadMediaResponse struct {
 	Message  string `json:"message"`
 	Filename string `json:"filename,omitempty"`
 	Path     string `json:"path,omitempty"`
+}
+
+// MarkReadRequest is the body for POST /api/mark_read (WhatsApp blue ticks).
+// Provide message_id / message_ids, or omit both to mark recent inbound rows
+// for chat_jid from the local store.
+type MarkReadRequest struct {
+	ChatJID    string   `json:"chat_jid"`
+	MessageID  string   `json:"message_id,omitempty"`
+	MessageIDs []string `json:"message_ids,omitempty"`
+	SenderJID  string   `json:"sender_jid,omitempty"`
+}
+
+// MarkReadResponse is returned by /api/mark_read.
+type MarkReadResponse struct {
+	Success    bool     `json:"success"`
+	Message    string   `json:"message"`
+	MarkedIDs  []string `json:"marked_ids,omitempty"`
+	ChatJID    string   `json:"chat_jid,omitempty"`
 }
 
 // Store additional media info in the database
@@ -2484,6 +2536,164 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 				"message": fmt.Sprintf("Typing indicator set to %v", req.IsTyping),
 			})
 		}
+	}))
+
+	// Handler for marking inbound messages as read (blue ticks / two checkmarks).
+	mux.HandleFunc("/api/mark_read", auth(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req MarkReadRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		if req.ChatJID == "" {
+			http.Error(w, "chat_jid is required", http.StatusBadRequest)
+			return
+		}
+
+		chatJID, err := types.ParseJID(req.ChatJID)
+		if err != nil || chatJID.User == "" {
+			http.Error(w, fmt.Sprintf("Invalid chat_jid: %v", err), http.StatusBadRequest)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		if !client.IsConnected() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(MarkReadResponse{
+				Success: false,
+				Message: "WhatsApp client is not connected",
+				ChatJID: req.ChatJID,
+			})
+			return
+		}
+
+		ids := append([]string{}, req.MessageIDs...)
+		if req.MessageID != "" {
+			ids = append(ids, req.MessageID)
+		}
+		// Dedupe while preserving order.
+		seen := make(map[string]struct{}, len(ids))
+		uniq := make([]string, 0, len(ids))
+		for _, id := range ids {
+			id = strings.TrimSpace(id)
+			if id == "" {
+				continue
+			}
+			if _, ok := seen[id]; ok {
+				continue
+			}
+			seen[id] = struct{}{}
+			uniq = append(uniq, id)
+		}
+		ids = uniq
+
+		// Group message IDs by sender — MarkRead requires one sender per call.
+		type batch struct {
+			sender types.JID
+			ids    []types.MessageID
+		}
+		var batches []batch
+
+		if len(ids) > 0 {
+			var senderJID types.JID
+			switch {
+			case req.SenderJID != "":
+				senderJID, err = types.ParseJID(req.SenderJID)
+				if err != nil || senderJID.User == "" {
+					http.Error(w, fmt.Sprintf("Invalid sender_jid: %v", err), http.StatusBadRequest)
+					return
+				}
+			case chatJID.Server == types.DefaultUserServer || chatJID.Server == types.HiddenUserServer:
+				senderJID = chatJID
+			default:
+				http.Error(w, "sender_jid is required for group mark_read when message_ids are provided", http.StatusBadRequest)
+				return
+			}
+			msgIDs := make([]types.MessageID, len(ids))
+			for i, id := range ids {
+				msgIDs[i] = types.MessageID(id)
+			}
+			batches = append(batches, batch{sender: senderJID, ids: msgIDs})
+		} else {
+			refs, lookupErr := messageStore.GetRecentInboundForMarkRead(req.ChatJID, 20)
+			if lookupErr != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				_ = json.NewEncoder(w).Encode(MarkReadResponse{
+					Success: false,
+					Message: fmt.Sprintf("Failed to look up inbound messages: %v", lookupErr),
+					ChatJID: req.ChatJID,
+				})
+				return
+			}
+			if len(refs) == 0 {
+				_ = json.NewEncoder(w).Encode(MarkReadResponse{
+					Success: true,
+					Message: "No inbound messages to mark",
+					ChatJID: req.ChatJID,
+				})
+				return
+			}
+			bySender := map[string]*batch{}
+			order := make([]string, 0)
+			for _, ref := range refs {
+				senderKey := ref.Sender
+				if senderKey == "" {
+					senderKey = req.ChatJID
+				}
+				b := bySender[senderKey]
+				if b == nil {
+					parsed, perr := types.ParseJID(senderKey)
+					if perr != nil || parsed.User == "" {
+						if chatJID.Server == types.DefaultUserServer || chatJID.Server == types.HiddenUserServer {
+							parsed = chatJID
+						} else {
+							continue
+						}
+					}
+					b = &batch{sender: parsed}
+					bySender[senderKey] = b
+					order = append(order, senderKey)
+				}
+				b.ids = append(b.ids, types.MessageID(ref.ID))
+			}
+			for _, key := range order {
+				batches = append(batches, *bySender[key])
+			}
+		}
+
+		marked := make([]string, 0)
+		now := time.Now()
+		for _, b := range batches {
+			if len(b.ids) == 0 {
+				continue
+			}
+			if err := client.MarkRead(context.Background(), b.ids, now, chatJID, b.sender); err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				_ = json.NewEncoder(w).Encode(MarkReadResponse{
+					Success:   false,
+					Message:   fmt.Sprintf("MarkRead failed: %v", err),
+					MarkedIDs: marked,
+					ChatJID:   req.ChatJID,
+				})
+				return
+			}
+			for _, id := range b.ids {
+				marked = append(marked, string(id))
+			}
+		}
+
+		fmt.Printf("✓ /api/mark_read chat=%q count=%d\n", req.ChatJID, len(marked))
+		_ = json.NewEncoder(w).Encode(MarkReadResponse{
+			Success:   true,
+			Message:   fmt.Sprintf("Marked %d message(s) read", len(marked)),
+			MarkedIDs: marked,
+			ChatJID:   req.ChatJID,
+		})
 	}))
 
 	return mux

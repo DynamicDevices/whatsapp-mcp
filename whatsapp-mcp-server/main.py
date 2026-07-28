@@ -52,6 +52,9 @@ from whatsapp import (
 from whatsapp import (
     send_reaction as whatsapp_send_reaction,
 )
+from whatsapp import (
+    mark_read as whatsapp_mark_read,
+)
 
 # Initialize FastMCP server. Env-var handling is deferred to the __main__ block
 # so importing this module never parses env vars or exits the process.
@@ -364,6 +367,31 @@ def send_reaction(
         A dictionary containing success status and a status message
     """
     success, status_message = whatsapp_send_reaction(recipient, message_id, emoji, from_me, sender_jid)
+    return {"success": success, "message": status_message}
+
+
+@mcp.tool()
+def mark_read(
+    chat_jid: str,
+    message_id: str = "",
+    message_ids: list[str] | None = None,
+    sender_jid: str = "",
+) -> dict[str, Any]:
+    """Mark inbound WhatsApp message(s) as read (blue ticks / two checkmarks).
+
+    CursorPA wake path usually does this automatically for allowlisted wakes.
+    Use this tool for an explicit re-mark or when handling outside the wake server.
+
+    Args:
+        chat_jid: Chat JID (DM phone JID or group @g.us)
+        message_id: Optional single message ID
+        message_ids: Optional list of message IDs from the same sender
+        sender_jid: Required for groups when IDs are given; for DMs defaults to chat_jid
+
+    Returns:
+        success flag and status message
+    """
+    success, status_message = whatsapp_mark_read(chat_jid, message_id, message_ids, sender_jid)
     return {"success": success, "message": status_message}
 
 

@@ -992,6 +992,19 @@ type SendMessageResponse struct {
 	Message string `json:"message"`
 }
 
+// RevokeMessageRequest is POST /api/revoke — delete-for-everyone on our outbound.
+type RevokeMessageRequest struct {
+	ChatJID   string `json:"chat_jid"`
+	MessageID string `json:"message_id"`
+}
+
+// RevokeMessageResponse is returned by /api/revoke.
+type RevokeMessageResponse struct {
+	Success bool   `json:"success"`
+	Message string `json:"message"`
+}
+
+
 // SendMessageRequest represents the request body for the send message API
 type SendMessageRequest struct {
 	Recipient       string `json:"recipient"`
@@ -2344,6 +2357,47 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 		_ = json.NewEncoder(w).Encode(SendMessageResponse{
 			Success: success,
 			Message: message,
+		})
+	}))
+
+	// Handler for delete-for-everyone (our outbound messages)
+	mux.HandleFunc("/api/revoke", auth(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req RevokeMessageRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		if req.ChatJID == "" || req.MessageID == "" {
+			http.Error(w, "chat_jid and message_id are required", http.StatusBadRequest)
+			return
+		}
+		chatJID, err := types.ParseJID(req.ChatJID)
+		if err != nil {
+			// allow bare phone
+			chatJID, err = resolveRecipientJID(client, req.ChatJID)
+			if err != nil {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(RevokeMessageResponse{Success: false, Message: err.Error()})
+				return
+			}
+		}
+		resp, err := client.RevokeMessage(context.Background(), chatJID, types.MessageID(req.MessageID))
+		w.Header().Set("Content-Type", "application/json")
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(RevokeMessageResponse{Success: false, Message: err.Error()})
+			return
+		}
+		_ = messageStore.MarkMessageDeleted(req.MessageID, chatJID.String(), time.Now())
+		fmt.Printf("✓ /api/revoke chat=%q id=%q timestamp=%v\n", chatJID, req.MessageID, resp.Timestamp)
+		_ = json.NewEncoder(w).Encode(RevokeMessageResponse{
+			Success: true,
+			Message: fmt.Sprintf("Revoked %s", req.MessageID),
 		})
 	}))
 

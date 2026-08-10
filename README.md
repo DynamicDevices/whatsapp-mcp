@@ -190,6 +190,7 @@ Send a text message to a contact or group, optionally as a quoted reply.
 - `quoted_message_id` (optional): ID of the message to reply to. When provided, the sent message appears as a quoted reply in WhatsApp.
 - `quoted_sender_jid` (optional): Full JID of the author of the quoted message. Required for group replies so WhatsApp renders the correct attribution header.
 - `quoted_content` (optional): Text content of the quoted message, used for the reply preview. Only plain text is supported.
+- `mentions` (optional): List of users to @-mention, as phone numbers with country code (e.g. `["12025551234"]`) or JIDs. For each entry the message text must contain a matching `@<number>` token (e.g. `"thanks @12025551234!"`), which recipients' devices render as a highlighted, tappable mention that also notifies the user. Only meaningful in group chats.
 
 Inbound quoted replies are stored automatically. The `quoted_message_id` field in each message returned by `list_messages` indicates which message it is replying to (or `null` for non-replies).
 
@@ -337,9 +338,11 @@ Copy `.env.example` to `.env` and configure as needed:
 | `WHATSAPP_API_URL`     | `http://localhost:8080/api`              | Go bridge REST API URL                       |
 | `WHATSAPP_BRIDGE_TOKEN` | generated next to `WHATSMEOW_DB_PATH` as `.bridge-token` | Bearer token for bridge REST calls; also signed onto outbound webhook POSTs |
 | `WHATSAPP_MEDIA_ROOTS` | `~/.local/share/whatsapp-mcp/outbox`     | Path-list of directories allowed for outbound media files |
+| `WHATSAPP_DEVICE_NAME` | `whatsmeow` (whatsmeow default)          | Label shown for this connection under WhatsApp > Linked Devices. Set to a recognisable name. Applies at pair time only (re-pair to change) |
 | `WHATSAPP_MCP_TRANSPORT` | `stdio`                                | MCP transport to serve clients: `stdio`, `http`, or `sse` |
 | `WHATSAPP_MCP_HOST`    | `127.0.0.1`                              | Bind address for the `http`/`sse` transports |
 | `WHATSAPP_MCP_PORT`    | `8000`                                   | Port for the `http`/`sse` transports |
+| `WHATSAPP_PARENT_WATCHDOG_S` | `30`                              | Stdio parent-liveness poll interval (seconds); exits on parent reparent only |
 
 ### MCP transport (stdio vs http/sse)
 
@@ -490,6 +493,38 @@ Caveats:
 - **Only effective on a fresh pair.** With `whatsapp.db` already present, no new pair handshake fires and the flag is a no-op.
 - **Messages the phone has deleted are not recoverable** — auto-expire, low-storage cleanup, and manual delete all leave no trace for the phone to share.
 
+### Requesting history for a single chat (on-demand)
+
+`--full-history-pair` only applies to a fresh pair, so recovering a gap in one
+chat otherwise means deleting `whatsapp.db` and re-syncing everything. To ask
+the phone for older messages in a single chat *without* re-pairing:
+
+```bash
+curl -X POST http://127.0.0.1:8080/api/history \
+  -H "Authorization: Bearer $(cat whatsapp-bridge/store/.bridge-token)" \
+  -H "Content-Type: application/json" \
+  -d '{"chat_jid": "1234567890@s.whatsapp.net", "count": 50}'
+```
+
+The request is anchored on the **oldest message already stored** for that chat,
+so the phone returns messages from before it. Call it repeatedly to page
+further back. Results arrive asynchronously through the normal history-sync
+handler and land in `messages.db` — typically within a few seconds.
+
+| Field | Required | Description |
+| --------- | -------- | ------------------------------------------------------ |
+| `chat_jid` | yes | Chat to backfill (`...@s.whatsapp.net` or `...@g.us`) |
+| `count` | no | Messages to request; default `50`, capped at `500` |
+
+Caveats:
+
+- **The phone decides how much it returns**, exactly as with pair-time sync, so
+  `count` is a request rather than a guarantee.
+- **At least one message for the chat must already be stored**, since it is used
+  as the anchor. Chats with no local messages return `404`; send or receive one
+  message first.
+- Messages the phone has deleted are not recoverable, as above.
+
 ## Call History
 
 The bridge captures incoming WhatsApp voice and video calls live into a
@@ -577,6 +612,7 @@ flowchart LR
         DOWN["/api/download"]
         REACT["/api/react"]
         TYPE["/api/typing"]
+        HIST["/api/history"]
         HEALTH["/api/health"]
     end
 
@@ -675,6 +711,10 @@ are documented in [docs/RELEASING.md](docs/RELEASING.md).
 
 ### Authentication Issues
 
+- **Pairing fails with `Client outdated` or HTTP 405**: Update to the latest
+  release and rebuild the bridge. WhatsApp periodically raises the minimum
+  supported linked-device client version, which can make older whatsmeow builds
+  fail before pairing completes.
 - **QR Code Not Displaying**: Restart the bridge. Check terminal QR code support.
 - **Device Limit Reached**: Remove a linked device from WhatsApp Settings > Linked Devices.
 - **No Messages Loading**: Initial sync can take several minutes for large chat histories.

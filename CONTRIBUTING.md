@@ -79,4 +79,6 @@ If you find a vulnerability, **please don't open a public issue**. Use GitHub pr
 
 If a contribution is non-trivial, your name lands in the release notes (auto-generated). Significant ongoing contributors may be invited as repo collaborators.
 
+Alpha testers / mentees who exercise the fork (without necessarily opening PRs) are listed in [`ALPHA.md`](./ALPHA.md). That file is credit only — no contact details and not a WhatsApp allowlist.
+
 Thanks for keeping this project small, sharp, and useful.

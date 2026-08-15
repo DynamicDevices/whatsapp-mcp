@@ -2303,7 +2303,8 @@ func TestReactHandler_MissingFields_Returns400(t *testing.T) {
 	}
 }
 
-func TestReactHandler_GroupReactionMissingSenderJID_Returns400(t *testing.T) {
+func TestReactHandler_GroupReactionMissingSenderJID_Returns403WhenPostLocked(t *testing.T) {
+	// Capability deny must win before shape validation (jidoka).
 	const token = "supersecrettoken1234567890abcdef"
 	handler := newRESTMux(newTestClient(&mockLIDStore{}), newTestMessageStore(t), 8080, token, nil)
 
@@ -2315,12 +2316,15 @@ func TestReactHandler_GroupReactionMissingSenderJID_Returns400(t *testing.T) {
 
 	handler.ServeHTTP(resp, req)
 
-	if resp.Code != http.StatusBadRequest {
-		t.Errorf("expected 400 for missing sender_jid on group reaction, got %d", resp.Code)
+	if resp.Code != http.StatusForbidden {
+		t.Errorf("expected 403 group deny before sender_jid check, got %d body=%s", resp.Code, resp.Body.String())
+	}
+	bodyOut := resp.Body.String()
+	if !strings.Contains(bodyOut, "group_post_not_allowed") && !strings.Contains(bodyOut, "group_not_observed") {
+		t.Errorf("expected group capability deny, got %s", bodyOut)
 	}
 }
-
-func TestReactHandler_GroupReactionInvalidSenderJID_Returns400(t *testing.T) {
+func TestReactHandler_GroupReactionInvalidSenderJID_Returns403WhenPostLocked(t *testing.T) {
 	const token = "supersecrettoken1234567890abcdef"
 	handler := newRESTMux(newTestClient(&mockLIDStore{}), newTestMessageStore(t), 8080, token, nil)
 
@@ -2332,8 +2336,73 @@ func TestReactHandler_GroupReactionInvalidSenderJID_Returns400(t *testing.T) {
 
 	handler.ServeHTTP(resp, req)
 
+	if resp.Code != http.StatusForbidden {
+		t.Errorf("expected 403 group_post_not_allowed before invalid sender_jid check, got %d body=%s", resp.Code, resp.Body.String())
+	}
+}
+
+func TestReactHandler_GroupReactionPostAllowedMissingSenderJID_Returns400(t *testing.T) {
+	dir := t.TempDir()
+	al := filepath.Join(dir, "allow.json")
+	if err := os.WriteFile(al, []byte(`{
+  "admin": [{"jid":"447478346120@s.whatsapp.net"}],
+  "groups": [{"jid":"120363012345678901@g.us","name":"t","post_allowed":true}]
+}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("BRIDGE_ALLOWLIST_PATH", al)
+	t.Setenv("SEND_DISABLED", "false")
+	t.Setenv("SEND_DISABLED_FLAG", filepath.Join(dir, "no-such-flag"))
+
+	// Enroll a test signing key so post_allowed can proceed past the YubiKey
+	// capability gate and hit sender_jid shape validation.
+	priv, pub := genTestSSHKey(t, dir)
+	keyID := "test-key"
+	signers := writeTestSigners(t, dir, keyID, pub)
+	keysPath := filepath.Join(dir, "send-cap-keys.json")
+	keys := map[string]interface{}{
+		"namespace":            sendCapNamespace,
+		"allowed_signers_path": signers,
+		"nonce_store_path":     filepath.Join(dir, "nonces.json"),
+		"keys": []map[string]string{
+			{"serial": "38907480", "key_id": keyID, "public_key_path": priv + ".pub"},
+		},
+	}
+	rawKeys, _ := json.Marshal(keys)
+	if err := os.WriteFile(keysPath, rawKeys, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("BRIAR_SEND_CAP_KEYS", keysPath)
+	t.Setenv("BRIAR_SEND_CAP_ALLOWED_SIGNERS", signers)
+	t.Setenv("BRIAR_SEND_CAP_NONCES", filepath.Join(dir, "nonces.json"))
+
+	now := time.Now().UTC()
+	emoji := "👍"
+	fields := requestHashFields("react", "120363012345678901@g.us", "", "", "", "", nil, "", "3AABCDEF01234567", emoji, false, "")
+	rh, err := requestHash(fields)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cap := map[string]interface{}{
+		"v": sendCapVersion, "op": "react", "recipient": "120363012345678901@g.us",
+		"request_hash": rh, "media_hash": "", "lease_token_hash": "",
+		"iat": now.Format(time.RFC3339), "exp": now.Add(90 * time.Second).Format(time.RFC3339),
+		"nonce": "group-react-shape", "yk_serial": "38907480", "key_id": keyID,
+	}
+	capPath := mintTestCapability(t, priv, keyID, "38907480", cap, dir)
+
+	const token = "supersecrettoken1234567890abcdef"
+	handler := newRESTMux(newTestClient(&mockLIDStore{}), newTestMessageStore(t), 8080, token, nil)
+
+	body := `{"recipient":"120363012345678901@g.us","message_id":"3AABCDEF01234567","emoji":"👍","from_me":false,"send_capability_file":"` + capPath + `"}`
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/api/react", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+
 	if resp.Code != http.StatusBadRequest {
-		t.Errorf("expected 400 for invalid sender_jid on group reaction, got %d", resp.Code)
+		t.Errorf("expected 400 for missing sender_jid when post_allowed+cap, got %d body=%s", resp.Code, resp.Body.String())
 	}
 }
 

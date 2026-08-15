@@ -1004,15 +1004,16 @@ type RevokeMessageResponse struct {
 	Message string `json:"message"`
 }
 
-
 // SendMessageRequest represents the request body for the send message API
 type SendMessageRequest struct {
-	Recipient       string `json:"recipient"`
-	Message         string `json:"message"`
-	MediaPath       string `json:"media_path,omitempty"`
-	QuotedMessageID string `json:"quoted_message_id,omitempty"`
-	QuotedSenderJID string `json:"quoted_sender_jid,omitempty"`
-	QuotedContent   string `json:"quoted_content,omitempty"`
+	Recipient          string `json:"recipient"`
+	Message            string `json:"message"`
+	LeaseOwnerToken    string `json:"lease_owner_token,omitempty"`
+	MediaPath          string `json:"media_path,omitempty"`
+	QuotedMessageID    string `json:"quoted_message_id,omitempty"`
+	QuotedSenderJID    string `json:"quoted_sender_jid,omitempty"`
+	QuotedContent      string `json:"quoted_content,omitempty"`
+	SendCapabilityFile string `json:"send_capability_file,omitempty"`
 	// Mentions lists users to @-mention (phone numbers or JIDs). The message
 	// text must contain a matching "@<number>" token for each entry, or the
 	// mention won't render on recipients' devices.
@@ -1021,11 +1022,13 @@ type SendMessageRequest struct {
 
 // ReactRequest is the request body for the /api/react endpoint.
 type ReactRequest struct {
-	Recipient string  `json:"recipient"`  // chat JID
-	MessageID string  `json:"message_id"` // ID of the message being reacted to
-	FromMe    bool    `json:"from_me"`    // whether the reacted-to message was sent by us
-	SenderJID string  `json:"sender_jid"` // full JID of the reacted-to message's sender
-	Emoji     *string `json:"emoji"`      // reaction emoji; empty string removes the reaction
+	Recipient          string  `json:"recipient"`  // chat JID
+	MessageID          string  `json:"message_id"` // ID of the message being reacted to
+	FromMe             bool    `json:"from_me"`    // whether the reacted-to message was sent by us
+	SenderJID          string  `json:"sender_jid"` // full JID of the reacted-to message's sender
+	Emoji              *string `json:"emoji"`      // reaction emoji; empty string removes the reaction
+	LeaseOwnerToken    string  `json:"lease_owner_token,omitempty"`
+	SendCapabilityFile string  `json:"send_capability_file,omitempty"`
 }
 
 // classifyMediaPath maps a file extension to (whatsmeow upload type, MIME
@@ -2044,10 +2047,10 @@ type MarkReadRequest struct {
 
 // MarkReadResponse is returned by /api/mark_read.
 type MarkReadResponse struct {
-	Success    bool     `json:"success"`
-	Message    string   `json:"message"`
-	MarkedIDs  []string `json:"marked_ids,omitempty"`
-	ChatJID    string   `json:"chat_jid,omitempty"`
+	Success   bool     `json:"success"`
+	Message   string   `json:"message"`
+	MarkedIDs []string `json:"marked_ids,omitempty"`
+	ChatJID   string   `json:"chat_jid,omitempty"`
 }
 
 // Store additional media info in the database
@@ -2268,6 +2271,9 @@ func extractDirectPathFromURL(url string) string {
 // media_path.go.
 func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, token string, allowedMediaRoots []string) *http.ServeMux {
 	allowedHosts := buildAllowedHosts(port)
+	sendPolicy := loadSendPolicy()
+	leasePolicy := loadLeasePolicy()
+	sendCap := loadSendCapVerifier()
 	auth := func(h http.HandlerFunc) http.HandlerFunc {
 		return withAuth(token, allowedHosts, h)
 	}
@@ -2319,6 +2325,63 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 			return
 		}
 
+		// Enforce outbound policy at the bridge boundary so MCP, media/audio,
+		// helper scripts, and direct authenticated HTTP all share the same
+		// fail-closed decision. Inbound group observation is not permission to
+		// post: groups require an explicit post_allowed capability.
+		decision := sendPolicy.check(req.Recipient, req.Message)
+		if !decision.Allow {
+			sendPolicy.recordDeny(req.Recipient, decision.Reason, decision.Tier)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(w).Encode(SendMessageResponse{
+				Success: false,
+				Message: "send policy denied: " + decision.Reason,
+			})
+			return
+		}
+		leaseDecision := leasePolicy.check(req.Recipient, req.LeaseOwnerToken)
+		if !leaseDecision.Allow {
+			sendPolicy.recordDeny(req.Recipient, leaseDecision.Reason, decision.Tier)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusLocked)
+			_ = json.NewEncoder(w).Encode(SendMessageResponse{
+				Success: false,
+				Message: "send policy denied: " + leaseDecision.Reason,
+			})
+			return
+		}
+
+		// YubiKey-touch send capability: after policy+lease, before media read /
+		// whatsmeow. Day-ungate does not bypass. Path only — never log contents.
+		capDecision := sendCap.check(
+			req.SendCapabilityFile,
+			capabilityRequired(decision.Tier, req.Recipient, req.MediaPath != ""),
+			"send",
+			req.Recipient,
+			req.Message,
+			req.QuotedMessageID,
+			req.QuotedSenderJID,
+			req.QuotedContent,
+			req.Mentions,
+			req.MediaPath,
+			"",
+			"",
+			false,
+			"",
+			req.LeaseOwnerToken,
+		)
+		if !capDecision.Allow {
+			sendPolicy.recordDeny(req.Recipient, capDecision.Reason, decision.Tier)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(w).Encode(SendMessageResponse{
+				Success: false,
+				Message: "send policy denied: " + capDecision.Reason,
+			})
+			return
+		}
+
 		// Validate and canonicalize media_path against the configured roots
 		// before reading. This prevents the bridge from being used as a
 		// generic file-read primitive (e.g. media_path=/Users/x/.ssh/id_rsa).
@@ -2344,6 +2407,9 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 
 		// Send the message
 		success, message := sendWhatsAppMessage(client, messageStore, req.Recipient, req.Message, resolvedMediaPath, req.QuotedMessageID, req.QuotedSenderJID, req.QuotedContent, req.Mentions)
+		if success {
+			sendPolicy.recordSuccess(req.Recipient)
+		}
 		fmt.Printf("← /api/send success=%v status=%q\n", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
@@ -2412,6 +2478,54 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 			http.Error(w, "recipient, message_id, and emoji are required", http.StatusBadRequest)
 			return
 		}
+		// Jidoka: capability deny before shape validation so group hard-lock
+		// cannot be masked by missing sender_jid (Alex TWP review 2026-08-14).
+		decision := sendPolicy.check(req.Recipient, *req.Emoji)
+		if !decision.Allow {
+			sendPolicy.recordDeny(req.Recipient, decision.Reason, decision.Tier)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"error": "send policy denied: " + decision.Reason,
+			})
+			return
+		}
+		leaseDecision := leasePolicy.check(req.Recipient, req.LeaseOwnerToken)
+		if !leaseDecision.Allow {
+			sendPolicy.recordDeny(req.Recipient, leaseDecision.Reason, decision.Tier)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusLocked)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"error": "send policy denied: " + leaseDecision.Reason,
+			})
+			return
+		}
+		capDecision := sendCap.check(
+			req.SendCapabilityFile,
+			capabilityRequired(decision.Tier, req.Recipient, false),
+			"react",
+			req.Recipient,
+			"",
+			"",
+			"",
+			"",
+			nil,
+			"",
+			req.MessageID,
+			*req.Emoji,
+			req.FromMe,
+			req.SenderJID,
+			req.LeaseOwnerToken,
+		)
+		if !capDecision.Allow {
+			sendPolicy.recordDeny(req.Recipient, capDecision.Reason, decision.Tier)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"error": "send policy denied: " + capDecision.Reason,
+			})
+			return
+		}
 		chatJID, err := types.ParseJID(req.Recipient)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("Invalid recipient JID: %v", err), http.StatusBadRequest)
@@ -2448,6 +2562,7 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 			return
 		}
+		sendPolicy.recordSuccess(req.Recipient)
 		_ = json.NewEncoder(w).Encode(map[string]bool{"ok": true})
 	}))
 

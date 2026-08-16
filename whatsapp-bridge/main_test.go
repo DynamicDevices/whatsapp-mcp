@@ -1208,6 +1208,26 @@ func TestExtractTextContent_SurfacesMediaCaptions(t *testing.T) {
 			want: "",
 		},
 		{
+			name: "ContactMessage with name and TEL",
+			msg: &waProto.Message{
+				ContactMessage: &waProto.ContactMessage{
+					DisplayName: proto.String("Alex Keyter"),
+					Vcard:       proto.String("BEGIN:VCARD\nVERSION:3.0\nFN:Alex Keyter\nTEL;TYPE=CELL:+44 7958 023533\nEND:VCARD\n"),
+				},
+			},
+			want: "Contact: Alex Keyter (+44 7958 023533)",
+		},
+		{
+			name: "ContactMessage with name only",
+			msg: &waProto.Message{
+				ContactMessage: &waProto.ContactMessage{
+					DisplayName: proto.String("No Number"),
+					Vcard:       proto.String("BEGIN:VCARD\nFN:No Number\nEND:VCARD\n"),
+				},
+			},
+			want: "Contact: No Number",
+		},
+		{
 			name: "Nil message returns empty",
 			msg:  nil,
 			want: "",
@@ -1278,6 +1298,30 @@ func TestExtractMediaInfo_NoMediaReturnsEmpty(t *testing.T) {
 			gotType, gotFile, gotURL, len(gotKey), gotLen)
 	}
 }
+
+func TestExtractMediaInfo_Contact(t *testing.T) {
+	ts := time.Unix(1710000000, 0).UTC()
+	msgID := "TEST_CONTACT_ID"
+	msg := &waProto.Message{
+		ContactMessage: &waProto.ContactMessage{
+			DisplayName: proto.String("Alex Keyter"),
+			Vcard:       proto.String("BEGIN:VCARD\nTEL:+447958023533\nEND:VCARD\n"),
+		},
+	}
+	gotType, gotFile, gotURL, gotKey, _, _, gotLen := extractMediaInfo(msg, ts, msgID)
+	if gotType != "contact" {
+		t.Errorf("mediaType = %q, want contact", gotType)
+	}
+	wantFile := "contact_" + ts.Format("20060102_150405") + "_" + msgID + ".vcf"
+	if gotFile != wantFile {
+		t.Errorf("filename = %q, want %q", gotFile, wantFile)
+	}
+	if gotURL != "" || gotKey != nil || gotLen != 0 {
+		t.Errorf("contact should have empty download metadata: url=%q keyLen=%d len=%d",
+			gotURL, len(gotKey), gotLen)
+	}
+}
+
 
 func TestMigrateLegacyLIDChatsToPhoneJIDs_AggregatesByPhoneJIDDeterministically(t *testing.T) {
 	ms := newTestMessageStore(t)
@@ -1354,6 +1398,27 @@ func TestMigrateLegacyLIDChatsToPhoneJIDs_AggregatesByPhoneJIDDeterministically(
 // buildImageMessage constructs an events.Message that carries an ImageMessage
 // with no download metadata (URL/media-key are empty), so handleMessage will
 // classify it as an image but skip the synchronous download attempt.
+
+func buildContactMessage(chat, sender types.JID, isFromMe bool, name, vcard string) *events.Message {
+	return &events.Message{
+		Info: types.MessageInfo{
+			MessageSource: types.MessageSource{
+				Chat:     chat,
+				Sender:   sender,
+				IsFromMe: isFromMe,
+			},
+			ID:        "test-contact-001",
+			Timestamp: time.Now(),
+		},
+		Message: &waProto.Message{
+			ContactMessage: &waProto.ContactMessage{
+				DisplayName: proto.String(name),
+				Vcard:       proto.String(vcard),
+			},
+		},
+	}
+}
+
 func buildImageMessage(chat, sender types.JID, isFromMe bool, caption string) *events.Message {
 	img := &waProto.ImageMessage{}
 	if caption != "" {
@@ -1417,6 +1482,55 @@ func captureRawWebhook(t *testing.T) (*httptest.Server, <-chan map[string]any) {
 // TestHandleMessage_ImageOnly_WebhookForwarded verifies that an image message
 // with no text caption is forwarded to the webhook endpoint (not silently
 // dropped), and that the webhook payload contains the expected media fields.
+func buildAudioMessage(chat, sender types.JID, isFromMe bool) *events.Message {
+	return &events.Message{
+		Info: types.MessageInfo{
+			MessageSource: types.MessageSource{
+				Chat:     chat,
+				Sender:   sender,
+				IsFromMe: isFromMe,
+			},
+			ID:        "test-aud-001",
+			Timestamp: time.Now(),
+		},
+		// No URL/mediaKey: download is skipped; webhook should still fire.
+		Message: &waProto.Message{AudioMessage: &waProto.AudioMessage{}},
+	}
+}
+
+func TestHandleMessage_AudioOnly_WebhookForwarded(t *testing.T) {
+	srv, webhookCh := captureWebhook(t)
+	t.Setenv("WEBHOOK_URL", srv.URL)
+
+	client := newTestClient(&mockLIDStore{})
+	ms := newTestMessageStore(t)
+	logger := testLogger()
+
+	msg := buildAudioMessage(phonePN, phonePN, false)
+	handleMessage(client, ms, msg, logger)
+
+	if count := queryMessageCount(ms, phonePN.String()); count != 1 {
+		t.Errorf("expected 1 message stored, got %d", count)
+	}
+
+	select {
+	case payload := <-webhookCh:
+		if payload.MediaType != "audio" {
+			t.Errorf("expected mediaType=audio, got %q", payload.MediaType)
+		}
+		if payload.MessageID != "test-aud-001" {
+			t.Errorf("expected messageId=test-aud-001, got %q", payload.MessageID)
+		}
+		if payload.Content != "" {
+			t.Errorf("expected empty content for audio-only message, got %q", payload.Content)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for webhook call")
+	}
+}
+
+// TestHandleMessage_Contact_WebhookForwarded verifies contact/vCard shares are
+// stored and webhooked with a text summary and mediaType=contact.
 func TestHandleMessage_ImageOnly_WebhookForwarded(t *testing.T) {
 	srv, webhookCh := captureWebhook(t)
 	t.Setenv("WEBHOOK_URL", srv.URL)
@@ -1484,6 +1598,42 @@ func TestHandleMessage_ImageWithCaption_WebhookForwarded(t *testing.T) {
 
 // queryCallResult returns the (result, duration_sec, reason) for a call row,
 // or empties if no row exists.
+
+// TestHandleMessage_Contact_WebhookForwarded verifies contact/vCard shares are
+// stored and webhooked with a text summary and mediaType=contact.
+func TestHandleMessage_Contact_WebhookForwarded(t *testing.T) {
+	srv, webhookCh := captureWebhook(t)
+	t.Setenv("WEBHOOK_URL", srv.URL)
+
+	client := newTestClient(&mockLIDStore{})
+	ms := newTestMessageStore(t)
+	logger := testLogger()
+
+	vcard := "BEGIN:VCARD\nVERSION:3.0\nFN:Alex Keyter\nTEL;TYPE=CELL:+44 7958 023533\nEND:VCARD\n"
+	msg := buildContactMessage(phonePN, phonePN, false, "Alex Keyter", vcard)
+	handleMessage(client, ms, msg, logger)
+
+	if count := queryMessageCount(ms, phonePN.String()); count != 1 {
+		t.Errorf("expected 1 message stored, got %d", count)
+	}
+
+	select {
+	case payload := <-webhookCh:
+		if payload.MediaType != "contact" {
+			t.Errorf("expected mediaType=contact, got %q", payload.MediaType)
+		}
+		if payload.MessageID != "test-contact-001" {
+			t.Errorf("expected messageId=test-contact-001, got %q", payload.MessageID)
+		}
+		want := "Contact: Alex Keyter (+44 7958 023533)"
+		if payload.Content != want {
+			t.Errorf("expected content %q, got %q", want, payload.Content)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for webhook call")
+	}
+}
+
 func queryCallResult(ms *MessageStore, callID, chatJID string) (result string, duration sql.NullInt64, reason sql.NullString, found bool) {
 	err := ms.db.QueryRow(
 		"SELECT result, duration_sec, reason FROM calls WHERE call_id = ? AND chat_jid = ?",
@@ -2153,7 +2303,8 @@ func TestReactHandler_MissingFields_Returns400(t *testing.T) {
 	}
 }
 
-func TestReactHandler_GroupReactionMissingSenderJID_Returns400(t *testing.T) {
+func TestReactHandler_GroupReactionMissingSenderJID_Returns403WhenPostLocked(t *testing.T) {
+	// Capability deny must win before shape validation (jidoka).
 	const token = "supersecrettoken1234567890abcdef"
 	handler := newRESTMux(newTestClient(&mockLIDStore{}), newTestMessageStore(t), 8080, token, nil)
 
@@ -2165,12 +2316,15 @@ func TestReactHandler_GroupReactionMissingSenderJID_Returns400(t *testing.T) {
 
 	handler.ServeHTTP(resp, req)
 
-	if resp.Code != http.StatusBadRequest {
-		t.Errorf("expected 400 for missing sender_jid on group reaction, got %d", resp.Code)
+	if resp.Code != http.StatusForbidden {
+		t.Errorf("expected 403 group deny before sender_jid check, got %d body=%s", resp.Code, resp.Body.String())
+	}
+	bodyOut := resp.Body.String()
+	if !strings.Contains(bodyOut, "group_post_not_allowed") && !strings.Contains(bodyOut, "group_not_observed") {
+		t.Errorf("expected group capability deny, got %s", bodyOut)
 	}
 }
-
-func TestReactHandler_GroupReactionInvalidSenderJID_Returns400(t *testing.T) {
+func TestReactHandler_GroupReactionInvalidSenderJID_Returns403WhenPostLocked(t *testing.T) {
 	const token = "supersecrettoken1234567890abcdef"
 	handler := newRESTMux(newTestClient(&mockLIDStore{}), newTestMessageStore(t), 8080, token, nil)
 
@@ -2182,8 +2336,73 @@ func TestReactHandler_GroupReactionInvalidSenderJID_Returns400(t *testing.T) {
 
 	handler.ServeHTTP(resp, req)
 
+	if resp.Code != http.StatusForbidden {
+		t.Errorf("expected 403 group_post_not_allowed before invalid sender_jid check, got %d body=%s", resp.Code, resp.Body.String())
+	}
+}
+
+func TestReactHandler_GroupReactionPostAllowedMissingSenderJID_Returns400(t *testing.T) {
+	dir := t.TempDir()
+	al := filepath.Join(dir, "allow.json")
+	if err := os.WriteFile(al, []byte(`{
+  "admin": [{"jid":"447478346120@s.whatsapp.net"}],
+  "groups": [{"jid":"120363012345678901@g.us","name":"t","post_allowed":true}]
+}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("BRIDGE_ALLOWLIST_PATH", al)
+	t.Setenv("SEND_DISABLED", "false")
+	t.Setenv("SEND_DISABLED_FLAG", filepath.Join(dir, "no-such-flag"))
+
+	// Enroll a test signing key so post_allowed can proceed past the YubiKey
+	// capability gate and hit sender_jid shape validation.
+	priv, pub := genTestSSHKey(t, dir)
+	keyID := "test-key"
+	signers := writeTestSigners(t, dir, keyID, pub)
+	keysPath := filepath.Join(dir, "send-cap-keys.json")
+	keys := map[string]interface{}{
+		"namespace":            sendCapNamespace,
+		"allowed_signers_path": signers,
+		"nonce_store_path":     filepath.Join(dir, "nonces.json"),
+		"keys": []map[string]string{
+			{"serial": "38907480", "key_id": keyID, "public_key_path": priv + ".pub"},
+		},
+	}
+	rawKeys, _ := json.Marshal(keys)
+	if err := os.WriteFile(keysPath, rawKeys, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("BRIAR_SEND_CAP_KEYS", keysPath)
+	t.Setenv("BRIAR_SEND_CAP_ALLOWED_SIGNERS", signers)
+	t.Setenv("BRIAR_SEND_CAP_NONCES", filepath.Join(dir, "nonces.json"))
+
+	now := time.Now().UTC()
+	emoji := "👍"
+	fields := requestHashFields("react", "120363012345678901@g.us", "", "", "", "", nil, "", "3AABCDEF01234567", emoji, false, "")
+	rh, err := requestHash(fields)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cap := map[string]interface{}{
+		"v": sendCapVersion, "op": "react", "recipient": "120363012345678901@g.us",
+		"request_hash": rh, "media_hash": "", "lease_token_hash": "",
+		"iat": now.Format(time.RFC3339), "exp": now.Add(90 * time.Second).Format(time.RFC3339),
+		"nonce": "group-react-shape", "yk_serial": "38907480", "key_id": keyID,
+	}
+	capPath := mintTestCapability(t, priv, keyID, "38907480", cap, dir)
+
+	const token = "supersecrettoken1234567890abcdef"
+	handler := newRESTMux(newTestClient(&mockLIDStore{}), newTestMessageStore(t), 8080, token, nil)
+
+	body := `{"recipient":"120363012345678901@g.us","message_id":"3AABCDEF01234567","emoji":"👍","from_me":false,"send_capability_file":"` + capPath + `"}`
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/api/react", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+
 	if resp.Code != http.StatusBadRequest {
-		t.Errorf("expected 400 for invalid sender_jid on group reaction, got %d", resp.Code)
+		t.Errorf("expected 400 for missing sender_jid when post_allowed+cap, got %d body=%s", resp.Code, resp.Body.String())
 	}
 }
 
@@ -2560,5 +2779,54 @@ func TestSendHandler_MentionsField_PassedThrough(t *testing.T) {
 
 	if resp.Code != http.StatusBadRequest {
 		t.Errorf("expected 400 for empty recipient with mentions field, got %d", resp.Code)
+	}
+}
+
+func TestMarkReadHandler_MissingChatJID_Returns400(t *testing.T) {
+	const token = "supersecrettoken1234567890abcdef"
+	handler := newRESTMux(newTestClient(&mockLIDStore{}), newTestMessageStore(t), 8080, token, nil)
+
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/api/mark_read",
+		strings.NewReader(`{"message_id":"3AABCDEF"}`))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for missing chat_jid, got %d body=%s", resp.Code, resp.Body.String())
+	}
+}
+
+func TestMarkReadHandler_NoAuth_Returns401(t *testing.T) {
+	const token = "supersecrettoken1234567890abcdef"
+	handler := newRESTMux(newTestClient(&mockLIDStore{}), newTestMessageStore(t), 8080, token, nil)
+
+	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/api/mark_read",
+		strings.NewReader(`{"chat_jid":"447478346120@s.whatsapp.net","message_id":"3AABCDEF"}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+	if resp.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 without auth, got %d", resp.Code)
+	}
+}
+
+func TestGetRecentInboundForMarkRead(t *testing.T) {
+	ms := newTestMessageStore(t)
+	chat := "447478346120@s.whatsapp.net"
+	_ = ms.StoreChat(chat, "Alex", time.Now())
+	_ = ms.StoreMessage("id-out", chat, "me", "hi", time.Now().Add(-2*time.Minute), true, "", "", "", nil, nil, nil, 0, "")
+	_ = ms.StoreMessage("id-in-1", chat, chat, "hey", time.Now().Add(-time.Minute), false, "", "", "", nil, nil, nil, 0, "")
+	_ = ms.StoreMessage("id-in-2", chat, chat, "again", time.Now(), false, "", "", "", nil, nil, nil, 0, "")
+
+	refs, err := ms.GetRecentInboundForMarkRead(chat, 10)
+	if err != nil {
+		t.Fatalf("GetRecentInboundForMarkRead: %v", err)
+	}
+	if len(refs) != 2 {
+		t.Fatalf("expected 2 inbound refs, got %d (%#v)", len(refs), refs)
+	}
+	if refs[0].ID != "id-in-2" || refs[1].ID != "id-in-1" {
+		t.Fatalf("unexpected order: %#v", refs)
 	}
 }

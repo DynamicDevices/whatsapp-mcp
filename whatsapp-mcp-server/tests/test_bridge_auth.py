@@ -250,3 +250,30 @@ def test_send_message_without_mentions_omits_mentions_field(monkeypatch):
 
     payload = calls[0]["json"]
     assert "mentions" not in payload
+
+
+def test_outbound_tools_forward_lease_owner_token(monkeypatch):
+    calls = []
+    monkeypatch.setenv("WHATSAPP_BRIDGE_TOKEN", "test-token")
+
+    def fake_post(url, json, headers=None):
+        calls.append({"url": url, "json": json})
+        return DummyResponse()
+
+    monkeypatch.setattr(whatsapp.requests, "post", fake_post)
+
+    whatsapp.send_message(
+        "120363430911014713@g.us",
+        "hello",
+        lease_owner_token="lease-capability",
+    )
+    whatsapp.send_reaction(
+        "120363430911014713@g.us",
+        "3AABCDEF01234567",
+        "👍",
+        sender_jid="447700000000@s.whatsapp.net",
+        lease_owner_token="lease-capability",
+    )
+
+    assert calls[0]["json"]["lease_owner_token"] == "lease-capability"
+    assert calls[1]["json"]["lease_owner_token"] == "lease-capability"

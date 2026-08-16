@@ -766,6 +766,40 @@ func (store *MessageStore) GetMessages(chatJID string, limit int) ([]Message, er
 	return messages, nil
 }
 
+// InboundMessageRef is enough to send a MarkRead receipt for one stored message.
+type InboundMessageRef struct {
+	ID     string
+	Sender string
+}
+
+// GetRecentInboundForMarkRead returns recent inbound (not-from-me) message IDs
+// for a chat, newest first. Used when /api/mark_read is called without explicit IDs.
+func (store *MessageStore) GetRecentInboundForMarkRead(chatJID string, limit int) ([]InboundMessageRef, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	rows, err := store.db.Query(
+		`SELECT id, sender FROM messages
+		 WHERE chat_jid = ? AND is_from_me = 0 AND deleted_at IS NULL
+		 ORDER BY timestamp DESC LIMIT ?`,
+		chatJID, limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []InboundMessageRef
+	for rows.Next() {
+		var ref InboundMessageRef
+		if err := rows.Scan(&ref.ID, &ref.Sender); err != nil {
+			return nil, err
+		}
+		out = append(out, ref)
+	}
+	return out, rows.Err()
+}
+
 // Call storage methods.
 //
 // WhatsApp calls arrive as a sequence of events: Offer/OfferNotice → Accept →
@@ -890,6 +924,23 @@ func extractTextContent(msg *waProto.Message) string {
 		return doc.GetCaption()
 	}
 
+	// Contact shares have no conversation text; summarise name + TEL for storage/search.
+	if c := msg.GetContactMessage(); c != nil {
+		return formatContactMessage(c)
+	}
+	if arr := msg.GetContactsArrayMessage(); arr != nil {
+		parts := make([]string, 0, len(arr.GetContacts())+1)
+		if n := strings.TrimSpace(arr.GetDisplayName()); n != "" {
+			parts = append(parts, n)
+		}
+		for _, c := range arr.GetContacts() {
+			if s := formatContactMessage(c); s != "" {
+				parts = append(parts, s)
+			}
+		}
+		return strings.Join(parts, "\n")
+	}
+
 	// WhatsApp Business templates arrive hydrated — body lives in
 	// HydratedTemplate.HydratedContentText. Without this branch every
 	// template-sent message (e.g. WABA Connect Hrms_* notifications)
@@ -941,14 +992,28 @@ type SendMessageResponse struct {
 	Message string `json:"message"`
 }
 
+// RevokeMessageRequest is POST /api/revoke — delete-for-everyone on our outbound.
+type RevokeMessageRequest struct {
+	ChatJID   string `json:"chat_jid"`
+	MessageID string `json:"message_id"`
+}
+
+// RevokeMessageResponse is returned by /api/revoke.
+type RevokeMessageResponse struct {
+	Success bool   `json:"success"`
+	Message string `json:"message"`
+}
+
 // SendMessageRequest represents the request body for the send message API
 type SendMessageRequest struct {
-	Recipient       string `json:"recipient"`
-	Message         string `json:"message"`
-	MediaPath       string `json:"media_path,omitempty"`
-	QuotedMessageID string `json:"quoted_message_id,omitempty"`
-	QuotedSenderJID string `json:"quoted_sender_jid,omitempty"`
-	QuotedContent   string `json:"quoted_content,omitempty"`
+	Recipient          string `json:"recipient"`
+	Message            string `json:"message"`
+	LeaseOwnerToken    string `json:"lease_owner_token,omitempty"`
+	MediaPath          string `json:"media_path,omitempty"`
+	QuotedMessageID    string `json:"quoted_message_id,omitempty"`
+	QuotedSenderJID    string `json:"quoted_sender_jid,omitempty"`
+	QuotedContent      string `json:"quoted_content,omitempty"`
+	SendCapabilityFile string `json:"send_capability_file,omitempty"`
 	// Mentions lists users to @-mention (phone numbers or JIDs). The message
 	// text must contain a matching "@<number>" token for each entry, or the
 	// mention won't render on recipients' devices.
@@ -957,11 +1022,13 @@ type SendMessageRequest struct {
 
 // ReactRequest is the request body for the /api/react endpoint.
 type ReactRequest struct {
-	Recipient string  `json:"recipient"`  // chat JID
-	MessageID string  `json:"message_id"` // ID of the message being reacted to
-	FromMe    bool    `json:"from_me"`    // whether the reacted-to message was sent by us
-	SenderJID string  `json:"sender_jid"` // full JID of the reacted-to message's sender
-	Emoji     *string `json:"emoji"`      // reaction emoji; empty string removes the reaction
+	Recipient          string  `json:"recipient"`  // chat JID
+	MessageID          string  `json:"message_id"` // ID of the message being reacted to
+	FromMe             bool    `json:"from_me"`    // whether the reacted-to message was sent by us
+	SenderJID          string  `json:"sender_jid"` // full JID of the reacted-to message's sender
+	Emoji              *string `json:"emoji"`      // reaction emoji; empty string removes the reaction
+	LeaseOwnerToken    string  `json:"lease_owner_token,omitempty"`
+	SendCapabilityFile string  `json:"send_capability_file,omitempty"`
 }
 
 // classifyMediaPath maps a file extension to (whatsmeow upload type, MIME
@@ -1549,7 +1616,50 @@ func extractMediaInfo(msg *waProto.Message, msgTimestamp time.Time, msgID string
 			stk.GetURL(), stk.GetMediaKey(), stk.GetFileSHA256(), stk.GetFileEncSHA256(), stk.GetFileLength()
 	}
 
+	// Contact shares have no downloadable media URL; set mediaType so empty-caption
+	// contacts are still stored and eligible for webhook forwarding.
+	if msg.GetContactMessage() != nil {
+		return "contact", "contact_" + suffix + ".vcf", "", nil, nil, nil, 0
+	}
+	if msg.GetContactsArrayMessage() != nil {
+		return "contact", "contacts_" + suffix + ".vcf", "", nil, nil, nil, 0
+	}
+
 	return "", "", "", nil, nil, nil, 0
+}
+
+// formatContactMessage summarises a contact share as display name plus TEL lines.
+func formatContactMessage(c *waProto.ContactMessage) string {
+	if c == nil {
+		return ""
+	}
+	name := strings.TrimSpace(c.GetDisplayName())
+	vcard := c.GetVcard()
+	var tels []string
+	for _, line := range strings.Split(vcard, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(strings.ToUpper(line), "TEL") {
+			continue
+		}
+		if i := strings.Index(line, ":"); i >= 0 {
+			if tel := strings.TrimSpace(line[i+1:]); tel != "" {
+				tels = append(tels, tel)
+			}
+		}
+	}
+	switch {
+	case name != "" && len(tels) > 0:
+		return fmt.Sprintf("Contact: %s (%s)", name, strings.Join(tels, ", "))
+	case name != "":
+		return "Contact: " + name
+	case len(tels) > 0:
+		return "Contact: (" + strings.Join(tels, ", ") + ")"
+	default:
+		if strings.TrimSpace(vcard) != "" {
+			return "Contact: (vCard)"
+		}
+		return ""
+	}
 }
 
 // resolveLIDChat resolves a LID-based chat JID to its phone-based equivalent
@@ -1804,10 +1914,12 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	}
 
 	// For image messages, download media synchronously so we can include the base64
-	// payload in the webhook. Other media types (video, audio, document) are still
-	// downloaded asynchronously since they are not passed to the AI vision pipeline.
+	// payload in the webhook. Audio is also synced so captionless voice notes can be
+	// webhooked the same way. Other media types (video, document) stay async.
 	var imageDownloadPath string
 	var imageMimeType string
+	var audioDownloadPath string
+	var audioMimeType string
 	if mediaType == "image" && url != "" && len(mediaKey) > 0 {
 		logger.Infof("Downloading image media for message %s (synchronous)", msg.Info.ID)
 		success, _, _, dlPath, dlErr := downloadMedia(client, messageStore, msg.Info.ID, chatJID)
@@ -1833,8 +1945,21 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 				_, _, _, _, _ = downloadMedia(client, messageStore, msg.Info.ID, chatJID)
 			}()
 		}
-	} else if mediaType != "" && mediaType != "image" && url != "" && len(mediaKey) > 0 {
-		// Non-image media: async download for caching only (not sent to vision pipeline)
+	} else if mediaType == "audio" && url != "" && len(mediaKey) > 0 {
+		logger.Infof("Downloading audio media for message %s (synchronous)", msg.Info.ID)
+		success, _, _, dlPath, dlErr := downloadMedia(client, messageStore, msg.Info.ID, chatJID)
+		if success && dlErr == nil {
+			audioDownloadPath = dlPath
+			audioMimeType = "audio/ogg; codecs=opus"
+			logger.Infof("✅ Audio downloaded: %s", dlPath)
+		} else {
+			logger.Warnf("❌ Audio download failed: %v", dlErr)
+			go func() {
+				_, _, _, _, _ = downloadMedia(client, messageStore, msg.Info.ID, chatJID)
+			}()
+		}
+	} else if mediaType != "" && mediaType != "image" && mediaType != "audio" && url != "" && len(mediaKey) > 0 {
+		// Non-image/non-audio media: async download for caching only
 		logger.Infof("Auto-downloading %s media for message %s", mediaType, msg.Info.ID)
 		go func() {
 			success, _, _, downloadPath, err := downloadMedia(client, messageStore, msg.Info.ID, chatJID)
@@ -1848,21 +1973,34 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 
 	// Send webhook for incoming messages.
 	// Forward self-messages when FORWARD_SELF=true.
-	// Always forward image messages (even without a text caption) so the AI vision
-	// pipeline can analyse the image content.
+	// Always forward image, audio, and contact messages even without a text caption.
 	shouldForward := forwardSelfMessages || !msg.Info.IsFromMe
 	hasText := content != ""
 	hasImage := mediaType == "image"
+	hasAudio := mediaType == "audio"
+	hasContact := mediaType == "contact"
 
-	if shouldForward && (hasText || hasImage) {
+	if shouldForward && (hasText || hasImage || hasAudio || hasContact) {
 		if hasImage {
 			SendWebhookWithMedia(
 				sender, content, chatJID, msg.Info.IsFromMe,
 				quotedMessageId, quotedSender, quotedContent, quotedIsFromMe, mentionedJIDs,
 				msg.Info.ID, mediaType, imageMimeType, filename, imageDownloadPath,
 			)
+		} else if hasAudio {
+			SendWebhookWithMedia(
+				sender, content, chatJID, msg.Info.IsFromMe,
+				quotedMessageId, quotedSender, quotedContent, quotedIsFromMe, mentionedJIDs,
+				msg.Info.ID, mediaType, audioMimeType, filename, audioDownloadPath,
+			)
+		} else if hasContact {
+			SendWebhookWithMedia(
+				sender, content, chatJID, msg.Info.IsFromMe,
+				quotedMessageId, quotedSender, quotedContent, quotedIsFromMe, mentionedJIDs,
+				msg.Info.ID, mediaType, "text/vcard", filename, "",
+			)
 		} else {
-			SendWebhook(sender, content, chatJID, msg.Info.IsFromMe, quotedMessageId, quotedSender, quotedContent, quotedIsFromMe, mentionedJIDs)
+			SendWebhook(sender, content, chatJID, msg.Info.IsFromMe, quotedMessageId, quotedSender, quotedContent, quotedIsFromMe, mentionedJIDs, msg.Info.ID)
 		}
 	}
 
@@ -1895,6 +2033,24 @@ type DownloadMediaResponse struct {
 	Message  string `json:"message"`
 	Filename string `json:"filename,omitempty"`
 	Path     string `json:"path,omitempty"`
+}
+
+// MarkReadRequest is the body for POST /api/mark_read (WhatsApp blue ticks).
+// Provide message_id / message_ids, or omit both to mark recent inbound rows
+// for chat_jid from the local store.
+type MarkReadRequest struct {
+	ChatJID    string   `json:"chat_jid"`
+	MessageID  string   `json:"message_id,omitempty"`
+	MessageIDs []string `json:"message_ids,omitempty"`
+	SenderJID  string   `json:"sender_jid,omitempty"`
+}
+
+// MarkReadResponse is returned by /api/mark_read.
+type MarkReadResponse struct {
+	Success   bool     `json:"success"`
+	Message   string   `json:"message"`
+	MarkedIDs []string `json:"marked_ids,omitempty"`
+	ChatJID   string   `json:"chat_jid,omitempty"`
 }
 
 // Store additional media info in the database
@@ -2115,6 +2271,9 @@ func extractDirectPathFromURL(url string) string {
 // media_path.go.
 func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, token string, allowedMediaRoots []string) *http.ServeMux {
 	allowedHosts := buildAllowedHosts(port)
+	sendPolicy := loadSendPolicy()
+	leasePolicy := loadLeasePolicy()
+	sendCap := loadSendCapVerifier(allowedMediaRoots)
 	auth := func(h http.HandlerFunc) http.HandlerFunc {
 		return withAuth(token, allowedHosts, h)
 	}
@@ -2166,6 +2325,63 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 			return
 		}
 
+		// Enforce outbound policy at the bridge boundary so MCP, media/audio,
+		// helper scripts, and direct authenticated HTTP all share the same
+		// fail-closed decision. Inbound group observation is not permission to
+		// post: groups require an explicit post_allowed capability.
+		decision := sendPolicy.check(req.Recipient, req.Message)
+		if !decision.Allow {
+			sendPolicy.recordDeny(req.Recipient, decision.Reason, decision.Tier)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(w).Encode(SendMessageResponse{
+				Success: false,
+				Message: "send policy denied: " + decision.Reason,
+			})
+			return
+		}
+		leaseDecision := leasePolicy.check(req.Recipient, req.LeaseOwnerToken)
+		if !leaseDecision.Allow {
+			sendPolicy.recordDeny(req.Recipient, leaseDecision.Reason, decision.Tier)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusLocked)
+			_ = json.NewEncoder(w).Encode(SendMessageResponse{
+				Success: false,
+				Message: "send policy denied: " + leaseDecision.Reason,
+			})
+			return
+		}
+
+		// YubiKey-touch send capability: after policy+lease, before media read /
+		// whatsmeow. Day-ungate does not bypass. Path only — never log contents.
+		capDecision := sendCap.check(
+			req.SendCapabilityFile,
+			capabilityRequired(decision.Tier, req.Recipient, req.MediaPath != ""),
+			"send",
+			req.Recipient,
+			req.Message,
+			req.QuotedMessageID,
+			req.QuotedSenderJID,
+			req.QuotedContent,
+			req.Mentions,
+			req.MediaPath,
+			"",
+			"",
+			false,
+			"",
+			req.LeaseOwnerToken,
+		)
+		if !capDecision.Allow {
+			sendPolicy.recordDeny(req.Recipient, capDecision.Reason, decision.Tier)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(w).Encode(SendMessageResponse{
+				Success: false,
+				Message: "send policy denied: " + capDecision.Reason,
+			})
+			return
+		}
+
 		// Validate and canonicalize media_path against the configured roots
 		// before reading. This prevents the bridge from being used as a
 		// generic file-read primitive (e.g. media_path=/Users/x/.ssh/id_rsa).
@@ -2191,6 +2407,9 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 
 		// Send the message
 		success, message := sendWhatsAppMessage(client, messageStore, req.Recipient, req.Message, resolvedMediaPath, req.QuotedMessageID, req.QuotedSenderJID, req.QuotedContent, req.Mentions)
+		if success {
+			sendPolicy.recordSuccess(req.Recipient)
+		}
 		fmt.Printf("← /api/send success=%v status=%q\n", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
@@ -2207,6 +2426,47 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 		})
 	}))
 
+	// Handler for delete-for-everyone (our outbound messages)
+	mux.HandleFunc("/api/revoke", auth(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req RevokeMessageRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		if req.ChatJID == "" || req.MessageID == "" {
+			http.Error(w, "chat_jid and message_id are required", http.StatusBadRequest)
+			return
+		}
+		chatJID, err := types.ParseJID(req.ChatJID)
+		if err != nil {
+			// allow bare phone
+			chatJID, err = resolveRecipientJID(client, req.ChatJID)
+			if err != nil {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(RevokeMessageResponse{Success: false, Message: err.Error()})
+				return
+			}
+		}
+		resp, err := client.RevokeMessage(context.Background(), chatJID, types.MessageID(req.MessageID))
+		w.Header().Set("Content-Type", "application/json")
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(RevokeMessageResponse{Success: false, Message: err.Error()})
+			return
+		}
+		_ = messageStore.MarkMessageDeleted(req.MessageID, chatJID.String(), time.Now())
+		fmt.Printf("✓ /api/revoke chat=%q id=%q timestamp=%v\n", chatJID, req.MessageID, resp.Timestamp)
+		_ = json.NewEncoder(w).Encode(RevokeMessageResponse{
+			Success: true,
+			Message: fmt.Sprintf("Revoked %s", req.MessageID),
+		})
+	}))
+
 	// Handler for sending (or removing) emoji reactions
 	mux.HandleFunc("/api/react", auth(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -2216,6 +2476,54 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 		var req ReactRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Recipient == "" || req.MessageID == "" || req.Emoji == nil {
 			http.Error(w, "recipient, message_id, and emoji are required", http.StatusBadRequest)
+			return
+		}
+		// Jidoka: capability deny before shape validation so group hard-lock
+		// cannot be masked by missing sender_jid (Alex TWP review 2026-08-14).
+		decision := sendPolicy.check(req.Recipient, *req.Emoji)
+		if !decision.Allow {
+			sendPolicy.recordDeny(req.Recipient, decision.Reason, decision.Tier)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"error": "send policy denied: " + decision.Reason,
+			})
+			return
+		}
+		leaseDecision := leasePolicy.check(req.Recipient, req.LeaseOwnerToken)
+		if !leaseDecision.Allow {
+			sendPolicy.recordDeny(req.Recipient, leaseDecision.Reason, decision.Tier)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusLocked)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"error": "send policy denied: " + leaseDecision.Reason,
+			})
+			return
+		}
+		capDecision := sendCap.check(
+			req.SendCapabilityFile,
+			capabilityRequired(decision.Tier, req.Recipient, false),
+			"react",
+			req.Recipient,
+			"",
+			"",
+			"",
+			"",
+			nil,
+			"",
+			req.MessageID,
+			*req.Emoji,
+			req.FromMe,
+			req.SenderJID,
+			req.LeaseOwnerToken,
+		)
+		if !capDecision.Allow {
+			sendPolicy.recordDeny(req.Recipient, capDecision.Reason, decision.Tier)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"error": "send policy denied: " + capDecision.Reason,
+			})
 			return
 		}
 		chatJID, err := types.ParseJID(req.Recipient)
@@ -2254,6 +2562,7 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 			return
 		}
+		sendPolicy.recordSuccess(req.Recipient)
 		_ = json.NewEncoder(w).Encode(map[string]bool{"ok": true})
 	}))
 
@@ -2396,6 +2705,164 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 				"message": fmt.Sprintf("Typing indicator set to %v", req.IsTyping),
 			})
 		}
+	}))
+
+	// Handler for marking inbound messages as read (blue ticks / two checkmarks).
+	mux.HandleFunc("/api/mark_read", auth(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req MarkReadRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		if req.ChatJID == "" {
+			http.Error(w, "chat_jid is required", http.StatusBadRequest)
+			return
+		}
+
+		chatJID, err := types.ParseJID(req.ChatJID)
+		if err != nil || chatJID.User == "" {
+			http.Error(w, fmt.Sprintf("Invalid chat_jid: %v", err), http.StatusBadRequest)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		if !client.IsConnected() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(MarkReadResponse{
+				Success: false,
+				Message: "WhatsApp client is not connected",
+				ChatJID: req.ChatJID,
+			})
+			return
+		}
+
+		ids := append([]string{}, req.MessageIDs...)
+		if req.MessageID != "" {
+			ids = append(ids, req.MessageID)
+		}
+		// Dedupe while preserving order.
+		seen := make(map[string]struct{}, len(ids))
+		uniq := make([]string, 0, len(ids))
+		for _, id := range ids {
+			id = strings.TrimSpace(id)
+			if id == "" {
+				continue
+			}
+			if _, ok := seen[id]; ok {
+				continue
+			}
+			seen[id] = struct{}{}
+			uniq = append(uniq, id)
+		}
+		ids = uniq
+
+		// Group message IDs by sender — MarkRead requires one sender per call.
+		type batch struct {
+			sender types.JID
+			ids    []types.MessageID
+		}
+		var batches []batch
+
+		if len(ids) > 0 {
+			var senderJID types.JID
+			switch {
+			case req.SenderJID != "":
+				senderJID, err = types.ParseJID(req.SenderJID)
+				if err != nil || senderJID.User == "" {
+					http.Error(w, fmt.Sprintf("Invalid sender_jid: %v", err), http.StatusBadRequest)
+					return
+				}
+			case chatJID.Server == types.DefaultUserServer || chatJID.Server == types.HiddenUserServer:
+				senderJID = chatJID
+			default:
+				http.Error(w, "sender_jid is required for group mark_read when message_ids are provided", http.StatusBadRequest)
+				return
+			}
+			msgIDs := make([]types.MessageID, len(ids))
+			for i, id := range ids {
+				msgIDs[i] = types.MessageID(id)
+			}
+			batches = append(batches, batch{sender: senderJID, ids: msgIDs})
+		} else {
+			refs, lookupErr := messageStore.GetRecentInboundForMarkRead(req.ChatJID, 20)
+			if lookupErr != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				_ = json.NewEncoder(w).Encode(MarkReadResponse{
+					Success: false,
+					Message: fmt.Sprintf("Failed to look up inbound messages: %v", lookupErr),
+					ChatJID: req.ChatJID,
+				})
+				return
+			}
+			if len(refs) == 0 {
+				_ = json.NewEncoder(w).Encode(MarkReadResponse{
+					Success: true,
+					Message: "No inbound messages to mark",
+					ChatJID: req.ChatJID,
+				})
+				return
+			}
+			bySender := map[string]*batch{}
+			order := make([]string, 0)
+			for _, ref := range refs {
+				senderKey := ref.Sender
+				if senderKey == "" {
+					senderKey = req.ChatJID
+				}
+				b := bySender[senderKey]
+				if b == nil {
+					parsed, perr := types.ParseJID(senderKey)
+					if perr != nil || parsed.User == "" {
+						if chatJID.Server == types.DefaultUserServer || chatJID.Server == types.HiddenUserServer {
+							parsed = chatJID
+						} else {
+							continue
+						}
+					}
+					b = &batch{sender: parsed}
+					bySender[senderKey] = b
+					order = append(order, senderKey)
+				}
+				b.ids = append(b.ids, types.MessageID(ref.ID))
+			}
+			for _, key := range order {
+				batches = append(batches, *bySender[key])
+			}
+		}
+
+		marked := make([]string, 0)
+		now := time.Now()
+		for _, b := range batches {
+			if len(b.ids) == 0 {
+				continue
+			}
+			if err := client.MarkRead(context.Background(), b.ids, now, chatJID, b.sender); err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				_ = json.NewEncoder(w).Encode(MarkReadResponse{
+					Success:   false,
+					Message:   fmt.Sprintf("MarkRead failed: %v", err),
+					MarkedIDs: marked,
+					ChatJID:   req.ChatJID,
+				})
+				return
+			}
+			for _, id := range b.ids {
+				marked = append(marked, string(id))
+			}
+		}
+
+		fmt.Printf("✓ /api/mark_read chat=%q count=%d\n", req.ChatJID, len(marked))
+		_ = json.NewEncoder(w).Encode(MarkReadResponse{
+			Success:   true,
+			Message:   fmt.Sprintf("Marked %d message(s) read", len(marked)),
+			MarkedIDs: marked,
+			ChatJID:   req.ChatJID,
+		})
 	}))
 
 	return mux

@@ -997,6 +997,8 @@ def send_message(
     quoted_sender_jid: str = "",
     quoted_content: str = "",
     mentions: list[str] | None = None,
+    lease_owner_token: str = "",
+    send_capability_file: str = "",
 ) -> tuple[bool, str]:
     try:
         # Validate input
@@ -1008,6 +1010,10 @@ def send_message(
             "recipient": recipient,
             "message": message,
         }
+        if lease_owner_token:
+            payload["lease_owner_token"] = lease_owner_token
+        if send_capability_file:
+            payload["send_capability_file"] = send_capability_file
         if quoted_message_id:
             payload["quoted_message_id"] = quoted_message_id
             payload["quoted_sender_jid"] = quoted_sender_jid
@@ -1032,7 +1038,12 @@ def send_message(
         return False, f"Unexpected error: {str(e)}"
 
 
-def send_file(recipient: str, media_path: str) -> tuple[bool, str]:
+def send_file(
+    recipient: str,
+    media_path: str,
+    lease_owner_token: str = "",
+    send_capability_file: str = "",
+) -> tuple[bool, str]:
     try:
         # Validate input
         if not recipient:
@@ -1045,7 +1056,11 @@ def send_file(recipient: str, media_path: str) -> tuple[bool, str]:
             return False, f"Media file not found: {media_path}"
 
         url = f"{WHATSAPP_API_BASE_URL}/send"
-        payload = {"recipient": recipient, "media_path": media_path}
+        payload: dict[str, Any] = {"recipient": recipient, "media_path": media_path}
+        if lease_owner_token:
+            payload["lease_owner_token"] = lease_owner_token
+        if send_capability_file:
+            payload["send_capability_file"] = send_capability_file
 
         response = requests.post(url, json=payload, headers=_bridge_headers())
 
@@ -1064,7 +1079,12 @@ def send_file(recipient: str, media_path: str) -> tuple[bool, str]:
         return False, f"Unexpected error: {str(e)}"
 
 
-def send_audio_message(recipient: str, media_path: str) -> tuple[bool, str]:
+def send_audio_message(
+    recipient: str,
+    media_path: str,
+    lease_owner_token: str = "",
+    send_capability_file: str = "",
+) -> tuple[bool, str]:
     try:
         # Validate input
         if not recipient:
@@ -1083,7 +1103,11 @@ def send_audio_message(recipient: str, media_path: str) -> tuple[bool, str]:
                 return False, f"Error converting file to opus ogg. You likely need to install ffmpeg: {str(e)}"
 
         url = f"{WHATSAPP_API_BASE_URL}/send"
-        payload = {"recipient": recipient, "media_path": media_path}
+        payload: dict[str, Any] = {"recipient": recipient, "media_path": media_path}
+        if lease_owner_token:
+            payload["lease_owner_token"] = lease_owner_token
+        if send_capability_file:
+            payload["send_capability_file"] = send_capability_file
 
         response = requests.post(url, json=payload, headers=_bridge_headers())
 
@@ -1108,6 +1132,8 @@ def send_reaction(
     emoji: str,
     from_me: bool = False,
     sender_jid: str = "",
+    lease_owner_token: str = "",
+    send_capability_file: str = "",
 ) -> tuple[bool, str]:
     """Send (or remove) a reaction to a WhatsApp message.
 
@@ -1136,6 +1162,10 @@ def send_reaction(
             "from_me": from_me,
             "sender_jid": sender_jid,
         }
+        if lease_owner_token:
+            payload["lease_owner_token"] = lease_owner_token
+        if send_capability_file:
+            payload["send_capability_file"] = send_capability_file
 
         response = requests.post(url, json=payload, headers=_bridge_headers())
 
@@ -1147,6 +1177,51 @@ def send_reaction(
         else:
             return False, f"Error: HTTP {response.status_code} - {response.text}"
 
+    except requests.RequestException as e:
+        return False, f"Request error: {str(e)}"
+    except json.JSONDecodeError:
+        return False, f"Error parsing response: {response.text}"
+    except Exception as e:
+        return False, f"Unexpected error: {str(e)}"
+
+
+def mark_read(
+    chat_jid: str,
+    message_id: str = "",
+    message_ids: list[str] | None = None,
+    sender_jid: str = "",
+) -> tuple[bool, str]:
+    """Mark inbound WhatsApp message(s) as read (blue ticks).
+
+    Args:
+        chat_jid: Chat JID (DM phone JID or group @g.us).
+        message_id: Optional single message ID to mark.
+        message_ids: Optional list of message IDs (same sender).
+        sender_jid: Required for groups when IDs are provided; for DMs defaults to chat.
+
+    If neither message_id nor message_ids is set, the bridge marks recent inbound
+    messages for that chat from its local store.
+    """
+    try:
+        if not chat_jid:
+            return False, "chat_jid must be provided"
+
+        url = f"{WHATSAPP_API_BASE_URL}/mark_read"
+        payload: dict[str, Any] = {"chat_jid": chat_jid}
+        if message_id:
+            payload["message_id"] = message_id
+        if message_ids:
+            payload["message_ids"] = list(message_ids)
+        if sender_jid:
+            payload["sender_jid"] = sender_jid
+
+        response = requests.post(url, json=payload, headers=_bridge_headers())
+        if response.status_code == 200:
+            result = response.json()
+            if result.get("success"):
+                return True, result.get("message", "Marked read")
+            return False, result.get("message", "Unknown error")
+        return False, f"Error: HTTP {response.status_code} - {response.text}"
     except requests.RequestException as e:
         return False, f"Request error: {str(e)}"
     except json.JSONDecodeError:

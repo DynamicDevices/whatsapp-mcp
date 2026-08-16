@@ -1,5 +1,6 @@
 import os
 import signal
+import stat
 import sys
 from typing import Any
 
@@ -35,6 +36,9 @@ from whatsapp import (
     list_messages as whatsapp_list_messages,
 )
 from whatsapp import (
+    mark_read as whatsapp_mark_read,
+)
+from whatsapp import (
     msg_to_dict,
 )
 from whatsapp import (
@@ -52,6 +56,46 @@ from whatsapp import (
 from whatsapp import (
     send_reaction as whatsapp_send_reaction,
 )
+
+
+def _read_lease_token_file(path: str) -> str:
+    if not path:
+        return ""
+    info = os.stat(path)
+    if not stat.S_ISREG(info.st_mode):
+        raise ValueError("lease_token_file must be a regular file")
+    if info.st_uid != os.getuid() or (info.st_mode & 0o077):
+        raise ValueError("lease_token_file must be owned by this user with mode 0600")
+    with open(path, encoding="utf-8") as handle:
+        token = handle.read().strip()
+    if not token:
+        raise ValueError("lease_token_file is empty")
+    return token
+
+
+def _prepare_send_capability_file(path: str) -> str:
+    """Validate mode-0600 sidecar path; never return capability contents."""
+    if not path:
+        return ""
+    info = os.stat(path)
+    if not stat.S_ISREG(info.st_mode):
+        raise ValueError("send_capability_file must be a regular file")
+    if info.st_uid != os.getuid() or (info.st_mode & 0o077):
+        raise ValueError("send_capability_file must be owned by this user with mode 0600")
+    if info.st_size <= 0:
+        raise ValueError("send_capability_file is empty")
+    return path
+
+
+def _cleanup_send_capability_file(path: str) -> None:
+    """Single-use: delete after one send/react attempt (success or fail)."""
+    if not path:
+        return
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
 
 # Initialize FastMCP server. Env-var handling is deferred to the __main__ block
 # so importing this module never parses env vars or exits the process.
@@ -309,6 +353,8 @@ def send_message(
     quoted_sender_jid: str = "",
     quoted_content: str = "",
     mentions: list[str] | None = None,
+    lease_token_file: str = "",
+    send_capability_file: str = "",
 ) -> dict[str, Any]:
     """Send a WhatsApp message to a person or group. For group chats use the JID.
 
@@ -326,6 +372,11 @@ def send_message(
                   ["420601234567"]) or JIDs. For each entry the message text must contain
                   a matching "@<number>" token (e.g. "hi @420601234567"), otherwise the
                   mention won't render on recipients' devices. Only meaningful in groups.
+        lease_token_file: Mode-0600 token sidecar printed by `briar watch`; required
+                          when this chat has a live Briar lease.
+        send_capability_file: Mode-0600 YubiKey-touch capability path from ask_multiple_choice
+                              Send now (P0). Required for work/known/tester, groups, and
+                              non-Alex media. Never pass capability contents — path only.
 
     Returns:
         A dictionary containing success status and a status message
@@ -334,11 +385,21 @@ def send_message(
     if not recipient:
         return {"success": False, "message": "Recipient must be provided"}
 
-    # Call the whatsapp_send_message function with the unified recipient parameter
-    success, status_message = whatsapp_send_message(
-        recipient, message, quoted_message_id, quoted_sender_jid, quoted_content, mentions
-    )
-    return {"success": success, "message": status_message}
+    cap_path = _prepare_send_capability_file(send_capability_file)
+    try:
+        success, status_message = whatsapp_send_message(
+            recipient,
+            message,
+            quoted_message_id,
+            quoted_sender_jid,
+            quoted_content,
+            mentions,
+            _read_lease_token_file(lease_token_file),
+            cap_path,
+        )
+        return {"success": success, "message": status_message}
+    finally:
+        _cleanup_send_capability_file(cap_path)
 
 
 @mcp.tool()
@@ -348,6 +409,8 @@ def send_reaction(
     emoji: str,
     from_me: bool = False,
     sender_jid: str = "",
+    lease_token_file: str = "",
+    send_capability_file: str = "",
 ) -> dict[str, Any]:
     """Send (or remove) a reaction to a WhatsApp message.
 
@@ -359,46 +422,112 @@ def send_reaction(
         from_me: Whether the original message was sent by the current user (default False)
         sender_jid: JID of the original message sender — required for group messages when
                     from_me is False so the bridge can build the correct WhatsApp key
+        lease_token_file: Mode-0600 token sidecar printed by `briar watch`; required
+                          when this chat has a live Briar lease.
+        send_capability_file: Mode-0600 YubiKey-touch capability path from Send now (P0).
 
     Returns:
         A dictionary containing success status and a status message
     """
-    success, status_message = whatsapp_send_reaction(recipient, message_id, emoji, from_me, sender_jid)
+    cap_path = _prepare_send_capability_file(send_capability_file)
+    try:
+        success, status_message = whatsapp_send_reaction(
+            recipient,
+            message_id,
+            emoji,
+            from_me,
+            sender_jid,
+            _read_lease_token_file(lease_token_file),
+            cap_path,
+        )
+        return {"success": success, "message": status_message}
+    finally:
+        _cleanup_send_capability_file(cap_path)
+
+
+@mcp.tool()
+def mark_read(
+    chat_jid: str,
+    message_id: str = "",
+    message_ids: list[str] | None = None,
+    sender_jid: str = "",
+) -> dict[str, Any]:
+    """Mark inbound WhatsApp message(s) as read (blue ticks / two checkmarks).
+
+    CursorPA wake path usually does this automatically for allowlisted wakes.
+    Use this tool for an explicit re-mark or when handling outside the wake server.
+
+    Args:
+        chat_jid: Chat JID (DM phone JID or group @g.us)
+        message_id: Optional single message ID
+        message_ids: Optional list of message IDs from the same sender
+        sender_jid: Required for groups when IDs are given; for DMs defaults to chat_jid
+
+    Returns:
+        success flag and status message
+    """
+    success, status_message = whatsapp_mark_read(chat_jid, message_id, message_ids, sender_jid)
     return {"success": success, "message": status_message}
 
 
 @mcp.tool()
-def send_file(recipient: str, media_path: str) -> dict[str, Any]:
+def send_file(
+    recipient: str,
+    media_path: str,
+    lease_token_file: str = "",
+    send_capability_file: str = "",
+) -> dict[str, Any]:
     """Send a file such as a picture, raw audio, video or document via WhatsApp to the specified recipient. For group messages use the JID.
 
     Args:
         recipient: The recipient - either a phone number with country code but no + or other symbols,
                  or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
         media_path: The absolute path to the media file to send (image, video, document)
+        lease_token_file: Mode-0600 token sidecar printed by `briar watch`; required
+                          when this chat has a live Briar lease.
+        send_capability_file: Mode-0600 YubiKey-touch capability path from Send now (P0).
 
     Returns:
         A dictionary containing success status and a status message
     """
-
-    # Call the whatsapp_send_file function
-    success, status_message = whatsapp_send_file(recipient, media_path)
-    return {"success": success, "message": status_message}
+    cap_path = _prepare_send_capability_file(send_capability_file)
+    try:
+        success, status_message = whatsapp_send_file(
+            recipient, media_path, _read_lease_token_file(lease_token_file), cap_path
+        )
+        return {"success": success, "message": status_message}
+    finally:
+        _cleanup_send_capability_file(cap_path)
 
 
 @mcp.tool()
-def send_audio_message(recipient: str, media_path: str) -> dict[str, Any]:
+def send_audio_message(
+    recipient: str,
+    media_path: str,
+    lease_token_file: str = "",
+    send_capability_file: str = "",
+) -> dict[str, Any]:
     """Send any audio file as a WhatsApp audio message to the specified recipient. For group messages use the JID. If it errors due to ffmpeg not being installed, use send_file instead.
 
     Args:
         recipient: The recipient - either a phone number with country code but no + or other symbols,
                  or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
         media_path: The absolute path to the audio file to send (will be converted to Opus .ogg if it's not a .ogg file)
+        lease_token_file: Mode-0600 token sidecar printed by `briar watch`; required
+                          when this chat has a live Briar lease.
+        send_capability_file: Mode-0600 YubiKey-touch capability path from Send now (P0).
 
     Returns:
         A dictionary containing success status and a status message
     """
-    success, status_message = whatsapp_audio_voice_message(recipient, media_path)
-    return {"success": success, "message": status_message}
+    cap_path = _prepare_send_capability_file(send_capability_file)
+    try:
+        success, status_message = whatsapp_audio_voice_message(
+            recipient, media_path, _read_lease_token_file(lease_token_file), cap_path
+        )
+        return {"success": success, "message": status_message}
+    finally:
+        _cleanup_send_capability_file(cap_path)
 
 
 @mcp.tool()

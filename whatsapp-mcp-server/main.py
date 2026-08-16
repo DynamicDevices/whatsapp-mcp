@@ -445,7 +445,6 @@ def send_reaction(
         _cleanup_send_capability_file(cap_path)
 
 
-
 @mcp.tool()
 def mark_read(
     chat_jid: str,
@@ -529,7 +528,6 @@ def send_audio_message(
         return {"success": success, "message": status_message}
     finally:
         _cleanup_send_capability_file(cap_path)
-
 
 
 @mcp.tool()

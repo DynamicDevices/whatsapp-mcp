@@ -4,7 +4,6 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
 )
 
 func TestNormalizeJID(t *testing.T) {
@@ -16,6 +15,7 @@ func TestNormalizeJID(t *testing.T) {
 func TestSendPolicyDenyUnknownAndGroups(t *testing.T) {
 	dir := t.TempDir()
 	al := filepath.Join(dir, "allow.json")
+	groupAllowlist := filepath.Join(dir, "allowed-groups.json")
 	_ = os.WriteFile(al, []byte(`{
 	  "admin":[{"jid":"447478346120@s.whatsapp.net","name":"Alex"}],
 	  "family":[{"jid":"447948173289@s.whatsapp.net","name":"Dionne"}],
@@ -26,17 +26,21 @@ func TestSendPolicyDenyUnknownAndGroups(t *testing.T) {
 	  ],
 	  "rate_limit_seconds":{"friends":1,"admin":0,"family":0,"groups":0}
 	}`), 0o600)
+	_ = os.WriteFile(groupAllowlist, []byte(`{
+	  "groups":["120363427935538418@g.us","120363430911014713@g.us"]
+	}`), 0o600)
 	t.Setenv("BRIDGE_ALLOWLIST_PATH", al)
 	t.Setenv("SEND_DISABLED", "false")
 	t.Setenv("SEND_DISABLED_FLAG", filepath.Join(dir, "no-such-flag"))
 	p := loadSendPolicy()
+	p.groupAllowlistPath = groupAllowlist
 
 	d := p.check("999999999@s.whatsapp.net", "hi")
-	if d.Allow || d.Reason != "recipient_not_in_allowlist" {
+	if d.Allow || d.Reason != hardRecipientDeny {
 		t.Fatalf("unknown: %+v", d)
 	}
 	d = p.check("120363412221047647@g.us", "hi")
-	if d.Allow || d.Reason != "group_not_observed" {
+	if d.Allow || d.Reason != hardRecipientDeny {
 		t.Fatalf("group: %+v", d)
 	}
 	d = p.check("120363430911014713@g.us", "hi")
@@ -53,35 +57,71 @@ func TestSendPolicyDenyUnknownAndGroups(t *testing.T) {
 	}
 }
 
-func TestSendPolicyLightCapAndRate(t *testing.T) {
+func TestHardRecipientGateBlocksMichaelAndEveryOtherPersonalJID(t *testing.T) {
 	dir := t.TempDir()
 	al := filepath.Join(dir, "allow.json")
 	_ = os.WriteFile(al, []byte(`{
-	  "admin":[],"family":[],
+	  "admin":[{"jid":"447478346120@s.whatsapp.net","name":"Alex"}],
+	  "family":[{"jid":"447948173289@s.whatsapp.net","name":"Dionne"}],
 	  "friends":[{"jid":"447727653206@s.whatsapp.net","name":"Max"}],
-	  "work":[],"known":[],"tester":[],"groups":[],
-	  "rate_limit_seconds":{"friends":3600}
+	  "work":[{"jid":"447970314781@s.whatsapp.net","name":"Michael"}],
+	  "known":[],"tester":[],"groups":[]
 	}`), 0o600)
 	t.Setenv("BRIDGE_ALLOWLIST_PATH", al)
-	t.Setenv("SEND_LIGHT_MAX_RUNES", "5")
 	t.Setenv("SEND_DISABLED_FLAG", filepath.Join(dir, "nope"))
 	p := loadSendPolicy()
 
-	long := "abcdef"
-	d := p.check("447727653206@s.whatsapp.net", long)
-	if d.Allow {
-		t.Fatalf("expected light cap deny: %+v", d)
+	for _, jid := range []string{
+		"447970314781@s.whatsapp.net",
+		"447948173289@s.whatsapp.net",
+		"447727653206@s.whatsapp.net",
+		"123456789@lid",
+	} {
+		d := p.check(jid, "must never send")
+		if d.Allow || d.Reason != hardRecipientDeny {
+			t.Fatalf("%s was not hard-blocked: %+v", jid, d)
+		}
 	}
-	d = p.check("447727653206@s.whatsapp.net", "hi")
-	if !d.Allow {
-		t.Fatalf("short ok: %+v", d)
+	if d := p.check("447478346120@s.whatsapp.net", "dry-run"); !d.Allow || d.Tier != "admin" {
+		t.Fatalf("Alex DM should remain allowed: %+v", d)
 	}
-	p.recordSuccess("447727653206@s.whatsapp.net")
-	p.lastSend["447727653206@s.whatsapp.net"] = time.Now()
-	d = p.check("447727653206@s.whatsapp.net", "hi")
-	if d.Allow {
-		t.Fatalf("expected rate limit: %+v", d)
+}
+
+func TestHardRecipientGateGroupsFailClosed(t *testing.T) {
+	dir := t.TempDir()
+	jid := "120363430911014713@g.us"
+
+	for name, contents := range map[string]*string{
+		"missing":   nil,
+		"malformed": ptrString(`{"groups":`),
+		"empty":     ptrString(`{"groups":[]}`),
+		"wrong":     ptrString(`{"groups":["120363999999999999@g.us"]}`),
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(dir, name+".json")
+			if contents != nil {
+				if err := os.WriteFile(path, []byte(*contents), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			d := hardRecipientDecisionAt(jid, path)
+			if d.Allow || d.Reason != hardRecipientDeny {
+				t.Fatalf("group gate did not fail closed: %+v", d)
+			}
+		})
 	}
+
+	allowed := filepath.Join(dir, "allowed.json")
+	if err := os.WriteFile(allowed, []byte(`{"groups":["120363430911014713@g.us"]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if d := hardRecipientDecisionAt(jid, allowed); !d.Allow || d.Tier != "groups" {
+		t.Fatalf("explicitly allowlisted group denied: %+v", d)
+	}
+}
+
+func ptrString(value string) *string {
+	return &value
 }
 
 func TestSendDisabledFlag(t *testing.T) {
@@ -101,10 +141,12 @@ func TestSendDisabledFlag(t *testing.T) {
 func TestGroupPostCannotBeEnabledByEnvironment(t *testing.T) {
 	dir := t.TempDir()
 	al := filepath.Join(dir, "allow.json")
+	groupAllowlist := filepath.Join(dir, "allowed-groups.json")
 	_ = os.WriteFile(al, []byte(`{
 	  "admin":[],"family":[],"friends":[],"work":[],"known":[],"tester":[],
 	  "groups":[{"jid":"120363430911014713@g.us","name":"Observed only"}]
 	}`), 0o600)
+	_ = os.WriteFile(groupAllowlist, []byte(`{"groups":["120363430911014713@g.us"]}`), 0o600)
 	t.Setenv("BRIDGE_ALLOWLIST_PATH", al)
 	t.Setenv("SEND_ALLOW_GROUPS", "true")
 	t.Setenv("SEND_POLICY_OFF", "true")
@@ -112,6 +154,7 @@ func TestGroupPostCannotBeEnabledByEnvironment(t *testing.T) {
 	t.Setenv("SEND_DISABLED_FLAG", filepath.Join(dir, "no-such-flag"))
 
 	p := loadSendPolicy()
+	p.groupAllowlistPath = groupAllowlist
 	d := p.check("120363430911014713@g.us", "must stay denied")
 	if d.Allow || d.Reason != "group_post_not_allowed" {
 		t.Fatalf("runtime env bypassed hard group lock: %+v", d)
@@ -121,6 +164,10 @@ func TestGroupPostCannotBeEnabledByEnvironment(t *testing.T) {
 func TestGroupPostRevocationTakesEffectWithoutRestart(t *testing.T) {
 	dir := t.TempDir()
 	al := filepath.Join(dir, "allow.json")
+	groupAllowlist := filepath.Join(dir, "allowed-groups.json")
+	if err := os.WriteFile(groupAllowlist, []byte(`{"groups":["120363430911014713@g.us"]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	writePolicy := func(allowed bool) {
 		value := "false"
 		if allowed {
@@ -139,6 +186,7 @@ func TestGroupPostRevocationTakesEffectWithoutRestart(t *testing.T) {
 	t.Setenv("SEND_DISABLED_FLAG", filepath.Join(dir, "no-such-flag"))
 	writePolicy(true)
 	p := loadSendPolicy()
+	p.groupAllowlistPath = groupAllowlist
 	if d := p.check("120363430911014713@g.us", "first"); !d.Allow {
 		t.Fatalf("expected explicit capability to allow: %+v", d)
 	}

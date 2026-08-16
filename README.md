@@ -783,6 +783,13 @@ go run .
 
 > **Caution**: As with many MCP servers, this is subject to [the lethal trifecta](https://simonwillison.net/2025/Jun/16/the-lethal-trifecta/). Prompt injection could lead to private data exfiltration. Use with awareness.
 
+The Dynamic Devices Briar deployment adds a non-bypassable outbound recipient
+boundary in the Go bridge: direct messages may target only Alex's canonical
+JID (`447478346120@s.whatsapp.net`). Group sends additionally require the exact
+JID in `~/.config/cursorpa/allowed-groups.json`; missing, malformed, or empty
+configuration allows no groups. These checks run before the existing group
+posting, lease, rate, and YubiKey capability gates.
+
 ## License
 
 MIT License - see [LICENSE](LICENSE) for details.

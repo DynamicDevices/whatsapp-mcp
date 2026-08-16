@@ -123,6 +123,19 @@ When adding a new env var: document it here, in `README.md`, and in `.env.exampl
 5. **`messages.db` is the source of truth for the MCP server.** Don't make the MCP server dependent on the bridge being up for *read* operations.
 6. **Outgoing calls are not visible to linked devices.** Don't promise features that depend on them.
 
+## Briar outbound safety boundary
+
+- Never send a WhatsApp DM to anyone except Alex at the exact canonical JID
+  `447478346120@s.whatsapp.net`. Ask Alex to relay anything intended for
+  another person.
+- Group sends require the exact group JID in
+  `~/.config/cursorpa/allowed-groups.json`, which Alex controls after
+  confirming he is a member, plus the existing `post_allowed`, lease, and
+  YubiKey gates. An empty or unreadable group allowlist permits no groups.
+- This is enforced in the Go bridge before transport for messages, media,
+  audio, quoted replies, mentions, and reactions. Do not add environment,
+  CLI, MCP, or "just this once" bypasses.
+
 ## Where to make changes
 
 | You want to… | Touch this file |

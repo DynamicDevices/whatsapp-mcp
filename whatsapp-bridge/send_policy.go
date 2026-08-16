@@ -20,8 +20,13 @@ const (
 	defaultLightMaxRunes = 280
 	// Live allowlist — outside git skill tree (briar-live-state-preserve).
 	defaultAllowlistPath = "/home/ajlennon/.config/cursorpa/wake-allowlist.json"
-	defaultDenyLogPath   = "/home/ajlennon/.local/share/briar/send-policy-denies.jsonl"
-	defaultNotifyFlag    = "/home/ajlennon/.local/share/briar/send-policy-NOTIFY"
+	// Hard outbound boundary. This path is intentionally not configurable by
+	// environment variables or agent flags.
+	allowedGroupsPath  = "/home/ajlennon/.config/cursorpa/allowed-groups.json"
+	alexDMJID          = "447478346120@s.whatsapp.net"
+	hardRecipientDeny  = "BLOCKED: direct DM to non-Alex contacts is forbidden; only Alex DM or allowlisted groups"
+	defaultDenyLogPath = "/home/ajlennon/.local/share/briar/send-policy-denies.jsonl"
+	defaultNotifyFlag  = "/home/ajlennon/.local/share/briar/send-policy-NOTIFY"
 )
 
 type wakeAllowlistFile struct {
@@ -42,18 +47,19 @@ type allowEntry struct {
 }
 
 type SendPolicy struct {
-	mu            sync.Mutex
-	byJID         map[string]string // normalized jid -> tier
-	groupPost     map[string]bool   // explicit outbound capability; inbound listing is insufficient
-	rates         map[string]int
-	lastSend      map[string]time.Time
-	lightMax      int
-	allowlistPath string
-	denyLogPath   string
-	notifyPath    string
-	burstWindow   time.Duration
-	burstCount    int
-	burstHits     []time.Time
+	mu                 sync.Mutex
+	byJID              map[string]string // normalized jid -> tier
+	groupPost          map[string]bool   // explicit outbound capability; inbound listing is insufficient
+	rates              map[string]int
+	lastSend           map[string]time.Time
+	lightMax           int
+	allowlistPath      string
+	groupAllowlistPath string
+	denyLogPath        string
+	notifyPath         string
+	burstWindow        time.Duration
+	burstCount         int
+	burstHits          []time.Time
 }
 
 type policyDecision struct {
@@ -62,18 +68,57 @@ type policyDecision struct {
 	Reason string
 }
 
+type outboundGroupAllowlist struct {
+	Groups []string `json:"groups"`
+}
+
+// hardRecipientDecision is the non-bypassable outer boundary for every
+// outbound bridge interaction. Personal allowlist tiers are inbound-only:
+// only Alex's exact canonical DM JID may receive a direct message. Group
+// entries represent Alex's explicit approval after confirming his membership.
+// Missing, malformed, or non-exact group entries fail closed.
+func hardRecipientDecisionAt(recipient, groupAllowlistPath string) policyDecision {
+	jid := normalizeJID(recipient)
+	if jid == alexDMJID {
+		return policyDecision{Allow: true, Tier: "admin", Reason: "ok"}
+	}
+	if !strings.HasSuffix(jid, "@g.us") {
+		return policyDecision{Allow: false, Tier: "blocked_dm", Reason: hardRecipientDeny}
+	}
+
+	data, err := os.ReadFile(groupAllowlistPath)
+	if err != nil {
+		return policyDecision{Allow: false, Tier: "groups", Reason: hardRecipientDeny}
+	}
+	var allowlist outboundGroupAllowlist
+	if err := json.Unmarshal(data, &allowlist); err != nil {
+		return policyDecision{Allow: false, Tier: "groups", Reason: hardRecipientDeny}
+	}
+	for _, allowed := range allowlist.Groups {
+		if normalizeJID(allowed) == jid {
+			return policyDecision{Allow: true, Tier: "groups", Reason: "ok"}
+		}
+	}
+	return policyDecision{Allow: false, Tier: "groups", Reason: hardRecipientDeny}
+}
+
+func hardRecipientDecision(recipient string) policyDecision {
+	return hardRecipientDecisionAt(recipient, allowedGroupsPath)
+}
+
 func loadSendPolicy() *SendPolicy {
 	p := &SendPolicy{
-		byJID:         map[string]string{},
-		groupPost:     map[string]bool{},
-		rates:         map[string]int{},
-		lastSend:      map[string]time.Time{},
-		lightMax:      envInt("SEND_LIGHT_MAX_RUNES", defaultLightMaxRunes),
-		allowlistPath: envOr("BRIDGE_ALLOWLIST_PATH", defaultAllowlistPath),
-		denyLogPath:   envOr("SEND_DENY_LOG", defaultDenyLogPath),
-		notifyPath:    envOr("SEND_NOTIFY_FLAG", defaultNotifyFlag),
-		burstWindow:   time.Duration(envInt("SEND_BURST_WINDOW_SEC", 60)) * time.Second,
-		burstCount:    envInt("SEND_BURST_DENIES", 5),
+		byJID:              map[string]string{},
+		groupPost:          map[string]bool{},
+		rates:              map[string]int{},
+		lastSend:           map[string]time.Time{},
+		lightMax:           envInt("SEND_LIGHT_MAX_RUNES", defaultLightMaxRunes),
+		allowlistPath:      envOr("BRIDGE_ALLOWLIST_PATH", defaultAllowlistPath),
+		groupAllowlistPath: allowedGroupsPath,
+		denyLogPath:        envOr("SEND_DENY_LOG", defaultDenyLogPath),
+		notifyPath:         envOr("SEND_NOTIFY_FLAG", defaultNotifyFlag),
+		burstWindow:        time.Duration(envInt("SEND_BURST_WINDOW_SEC", 60)) * time.Second,
+		burstCount:         envInt("SEND_BURST_DENIES", 5),
 	}
 	path := p.allowlistPath
 	data, err := os.ReadFile(path)
@@ -188,6 +233,10 @@ func sendDisabled() bool {
 func (p *SendPolicy) check(recipient, message string) policyDecision {
 	if sendDisabled() {
 		return policyDecision{Allow: false, Tier: "", Reason: "SEND_DISABLED"}
+	}
+	hardDecision := hardRecipientDecisionAt(recipient, p.groupAllowlistPath)
+	if !hardDecision.Allow {
+		return hardDecision
 	}
 	jid := normalizeJID(recipient)
 	if jid == "" {

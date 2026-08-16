@@ -126,12 +126,47 @@ func sha256HexBytes(b []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func sha256HexFile(path string, allowedRoots []string) (string, error) {
-	resolved, err := validateMediaPath(path, allowedRoots)
-	if err != nil {
-		return "", err
+func openRootedRegularFile(path string, allowedRoots []string) (*os.File, os.FileInfo, error) {
+	path = filepath.Clean(strings.TrimSpace(path))
+	if !filepath.IsAbs(path) {
+		return nil, nil, fmt.Errorf("path must be absolute")
 	}
-	f, err := os.Open(resolved)
+	for _, allowedRoot := range allowedRoots {
+		rootPath := filepath.Clean(allowedRoot)
+		relative, err := filepath.Rel(rootPath, path)
+		if err != nil || relative == "." || filepath.IsAbs(relative) ||
+			relative == ".." || strings.HasPrefix(relative, ".."+string(os.PathSeparator)) {
+			continue
+		}
+		root, err := os.OpenRoot(rootPath)
+		if err != nil {
+			continue
+		}
+		f, openErr := root.Open(relative)
+		closeErr := root.Close()
+		if openErr != nil {
+			continue
+		}
+		if closeErr != nil {
+			_ = f.Close()
+			return nil, nil, closeErr
+		}
+		st, statErr := f.Stat()
+		if statErr != nil {
+			_ = f.Close()
+			return nil, nil, statErr
+		}
+		if !st.Mode().IsRegular() {
+			_ = f.Close()
+			return nil, nil, fmt.Errorf("path must be a regular file")
+		}
+		return f, st, nil
+	}
+	return nil, nil, fmt.Errorf("path outside trusted directories")
+}
+
+func sha256HexFile(path string, allowedRoots []string) (string, error) {
+	f, _, err := openRootedRegularFile(path, allowedRoots)
 	if err != nil {
 		return "", err
 	}
@@ -236,31 +271,17 @@ func readCapabilitySidecar(path, capDir string) (*SendCapabilityFile, error) {
 	if path == "" {
 		return nil, fmt.Errorf("send_capability_file required")
 	}
-	if !filepath.IsAbs(path) {
-		return nil, fmt.Errorf("send_capability_file must be absolute")
-	}
-	resolvedDir, err := filepath.EvalSymlinks(capDir)
+	f, st, err := openRootedRegularFile(path, []string{capDir})
 	if err != nil {
-		return nil, fmt.Errorf("send_capability directory unavailable")
-	}
-	resolved, err := filepath.EvalSymlinks(path)
-	if err != nil ||
-		(resolved != resolvedDir &&
-			!strings.HasPrefix(resolved, resolvedDir+string(os.PathSeparator))) {
 		return nil, fmt.Errorf("send_capability_file outside trusted directory")
 	}
-	st, err := os.Stat(resolved)
-	if err != nil {
-		return nil, fmt.Errorf("send_capability_file unreadable")
-	}
-	if !st.Mode().IsRegular() {
-		return nil, fmt.Errorf("send_capability_file must be a regular file")
-	}
 	if st.Mode().Perm()&0o077 != 0 {
+		_ = f.Close()
 		return nil, fmt.Errorf("send_capability_file must be mode 0600")
 	}
-	raw, err := os.ReadFile(resolved)
-	if err != nil {
+	raw, readErr := io.ReadAll(f)
+	closeErr := f.Close()
+	if readErr != nil || closeErr != nil {
 		return nil, fmt.Errorf("send_capability_file unreadable")
 	}
 	var file SendCapabilityFile

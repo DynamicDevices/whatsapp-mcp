@@ -128,6 +128,14 @@ func TestReadCapabilitySidecarConfinesPath(t *testing.T) {
 	if _, err := readCapabilitySidecar(outside, capDir); err == nil {
 		t.Fatal("sidecar outside trusted directory must be rejected")
 	}
+
+	link := filepath.Join(capDir, "escaped.json")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readCapabilitySidecar(link, capDir); err == nil {
+		t.Fatal("sidecar symlink escaping trusted directory must be rejected")
+	}
 }
 
 func TestSHA256HexFileConfinesMediaPath(t *testing.T) {

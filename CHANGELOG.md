@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.2](https://github.com/DynamicDevices/whatsapp-mcp/compare/v0.5.1...v0.5.2) (2026-08-16)
+
+
+### Documentation
+
+* credit Jack as alpha tester / mentee ([#4](https://github.com/DynamicDevices/whatsapp-mcp/issues/4)) ([30233d4](https://github.com/DynamicDevices/whatsapp-mcp/commit/30233d48f7a5a501b2645b7c093cb6ca946bdce3))
+
 ## [0.5.1](https://github.com/verygoodplugins/whatsapp-mcp/compare/v0.5.0...v0.5.1) (2026-08-08)
 
 

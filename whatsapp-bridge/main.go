@@ -2273,7 +2273,7 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 	allowedHosts := buildAllowedHosts(port)
 	sendPolicy := loadSendPolicy()
 	leasePolicy := loadLeasePolicy()
-	sendCap := loadSendCapVerifier()
+	sendCap := loadSendCapVerifier(allowedMediaRoots)
 	auth := func(h http.HandlerFunc) http.HandlerFunc {
 		return withAuth(token, allowedHosts, h)
 	}

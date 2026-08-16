@@ -102,9 +102,50 @@ func newTestVerifier(t *testing.T, signersPath, noncePath string, serials map[st
 		keysPath:           filepath.Join(t.TempDir(), "keys.json"),
 		allowedSignersPath: signersPath,
 		noncePath:          noncePath,
+		capDir:             filepath.Dir(signersPath),
 		allowedSerials:     serials,
 		verifyFn:           sshVerifySignature,
 		nowFn:              func() time.Time { return time.Date(2026, 8, 15, 9, 0, 0, 0, time.UTC) },
+	}
+}
+
+func TestReadCapabilitySidecarConfinesPath(t *testing.T) {
+	capDir := t.TempDir()
+	inside := filepath.Join(capDir, "cap.json")
+	raw := []byte(`{"namespace":"briar-send-cap","capability":{"v":1},"signature":"signed"}`)
+	if err := os.WriteFile(inside, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readCapabilitySidecar(inside, capDir); err != nil {
+		t.Fatalf("trusted sidecar rejected: %v", err)
+	}
+
+	outsideDir := t.TempDir()
+	outside := filepath.Join(outsideDir, "cap.json")
+	if err := os.WriteFile(outside, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readCapabilitySidecar(outside, capDir); err == nil {
+		t.Fatal("sidecar outside trusted directory must be rejected")
+	}
+}
+
+func TestSHA256HexFileConfinesMediaPath(t *testing.T) {
+	root := t.TempDir()
+	inside := filepath.Join(root, "media.txt")
+	if err := os.WriteFile(inside, []byte("allowed"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sha256HexFile(inside, []string{root}); err != nil {
+		t.Fatalf("trusted media rejected: %v", err)
+	}
+
+	outside := filepath.Join(t.TempDir(), "media.txt")
+	if err := os.WriteFile(outside, []byte("denied"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sha256HexFile(outside, []string{root}); err == nil {
+		t.Fatal("media outside trusted roots must be rejected")
 	}
 }
 
@@ -209,7 +250,7 @@ func TestSendCapVerifierDenies(t *testing.T) {
 	t.Run("payload_mismatch", func(t *testing.T) {
 		cap := baseSendCap("447970314781@s.whatsapp.net", rh, "n-payload", now)
 		cap["key_id"] = keyID
-		path := mintTestCapability(t, priv, keyID, "38907480", cap, t.TempDir())
+		path := mintTestCapability(t, priv, keyID, "38907480", cap, dir)
 		d := v.check(path, true, "send", "447970314781@s.whatsapp.net", "DIFFERENT", "", "", "", nil, "", "", "", false, "", "")
 		if d.Allow || d.Reason != "send_capability_request_mismatch" {
 			t.Fatalf("%+v", d)
@@ -221,7 +262,7 @@ func TestSendCapVerifierDenies(t *testing.T) {
 		cap["iat"] = now.Add(-3 * time.Minute).UTC().Format(time.RFC3339)
 		cap["exp"] = now.Add(-1 * time.Minute).UTC().Format(time.RFC3339)
 		cap["key_id"] = keyID
-		path := mintTestCapability(t, priv, keyID, "38907480", cap, t.TempDir())
+		path := mintTestCapability(t, priv, keyID, "38907480", cap, dir)
 		d := v.check(path, true, "send", "447970314781@s.whatsapp.net", "probe", "", "", "", nil, "", "", "", false, "", "")
 		if d.Allow || d.Reason != "send_capability_expired" {
 			t.Fatalf("%+v", d)
@@ -232,7 +273,7 @@ func TestSendCapVerifierDenies(t *testing.T) {
 		cap := baseSendCap("447970314781@s.whatsapp.net", rh, "n-ser", now)
 		cap["yk_serial"] = "38907389"
 		cap["key_id"] = keyID
-		path := mintTestCapability(t, priv, keyID, "38907480", cap, t.TempDir())
+		path := mintTestCapability(t, priv, keyID, "38907480", cap, dir)
 		d := v.check(path, true, "send", "447970314781@s.whatsapp.net", "probe", "", "", "", nil, "", "", "", false, "", "")
 		if d.Allow || d.Reason != "send_capability_serial_not_enrolled" {
 			t.Fatalf("%+v", d)
@@ -242,7 +283,7 @@ func TestSendCapVerifierDenies(t *testing.T) {
 	t.Run("bad_signature", func(t *testing.T) {
 		cap := baseSendCap("447970314781@s.whatsapp.net", rh, "n-sig", now)
 		cap["key_id"] = keyID
-		path := mintTestCapability(t, priv, keyID, "38907480", cap, t.TempDir())
+		path := mintTestCapability(t, priv, keyID, "38907480", cap, dir)
 		raw, _ := os.ReadFile(path)
 		var file SendCapabilityFile
 		_ = json.Unmarshal(raw, &file)
@@ -263,7 +304,7 @@ func TestSendCapVerifierDenies(t *testing.T) {
 		v2 := newTestVerifier(t, signers, noncePath, map[string]string{"38907480": keyID})
 		cap := baseSendCap("447970314781@s.whatsapp.net", rh, "n-corrupt", now)
 		cap["key_id"] = keyID
-		path := mintTestCapability(t, priv, keyID, "38907480", cap, t.TempDir())
+		path := mintTestCapability(t, priv, keyID, "38907480", cap, dir)
 		d := v2.check(path, true, "send", "447970314781@s.whatsapp.net", "probe", "", "", "", nil, "", "", "", false, "", "")
 		if d.Allow || !strings.Contains(d.Reason, "corrupt") {
 			t.Fatalf("%+v", d)
@@ -273,7 +314,7 @@ func TestSendCapVerifierDenies(t *testing.T) {
 	t.Run("sidecar_perms", func(t *testing.T) {
 		cap := baseSendCap("447970314781@s.whatsapp.net", rh, "n-perm", now)
 		cap["key_id"] = keyID
-		path := mintTestCapability(t, priv, keyID, "38907480", cap, t.TempDir())
+		path := mintTestCapability(t, priv, keyID, "38907480", cap, dir)
 		if err := os.Chmod(path, 0o644); err != nil {
 			t.Fatal(err)
 		}

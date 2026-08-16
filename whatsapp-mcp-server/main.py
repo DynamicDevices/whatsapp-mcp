@@ -36,6 +36,9 @@ from whatsapp import (
     list_messages as whatsapp_list_messages,
 )
 from whatsapp import (
+    mark_read as whatsapp_mark_read,
+)
+from whatsapp import (
     msg_to_dict,
 )
 from whatsapp import (
@@ -52,9 +55,6 @@ from whatsapp import (
 )
 from whatsapp import (
     send_reaction as whatsapp_send_reaction,
-)
-from whatsapp import (
-    mark_read as whatsapp_mark_read,
 )
 
 

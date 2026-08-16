@@ -215,7 +215,6 @@ func (p *SendPolicy) check(recipient, message string) policyDecision {
 			return groupDecision
 		}
 		tier = "groups"
-		ok = true
 	} else if !ok {
 		return policyDecision{Allow: false, Tier: "unknown", Reason: "recipient_not_in_allowlist"}
 	}

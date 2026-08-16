@@ -20,6 +20,7 @@ const (
 	defaultSendCapKeysPath = "/home/ajlennon/.config/cursorpa/send-cap-keys.json"
 	defaultSendCapSigners  = "/home/ajlennon/.config/cursorpa/send-cap-allowed_signers"
 	defaultSendCapNonces   = "/home/ajlennon/.local/share/briar/send-cap-nonces.json"
+	defaultSendCapDir      = "/home/ajlennon/.local/share/whatsapp-mcp/send-caps"
 )
 
 // SendCapabilityFile is the mode-0600 sidecar written by ask-question minting.
@@ -49,6 +50,8 @@ type SendCapVerifier struct {
 	keysPath           string
 	allowedSignersPath string
 	noncePath          string
+	capDir             string
+	mediaRoots         []string
 	allowedSerials     map[string]string // serial -> key_id
 	verifyFn           func(message []byte, signature, principal, signersPath string) error
 	nowFn              func() time.Time
@@ -59,12 +62,14 @@ type sendCapDecision struct {
 	Reason string
 }
 
-func loadSendCapVerifier() *SendCapVerifier {
+func loadSendCapVerifier(mediaRoots []string) *SendCapVerifier {
 	keysPath := envOr("BRIAR_SEND_CAP_KEYS", defaultSendCapKeysPath)
 	v := &SendCapVerifier{
 		keysPath:           keysPath,
 		allowedSignersPath: envOr("BRIAR_SEND_CAP_ALLOWED_SIGNERS", defaultSendCapSigners),
 		noncePath:          envOr("BRIAR_SEND_CAP_NONCES", defaultSendCapNonces),
+		capDir:             envOr("BRIAR_SEND_CAP_DIR", defaultSendCapDir),
+		mediaRoots:         mediaRoots,
 		allowedSerials:     map[string]string{},
 		verifyFn:           sshVerifySignature,
 		nowFn:              func() time.Time { return time.Now().UTC() },
@@ -121,15 +126,23 @@ func sha256HexBytes(b []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func sha256HexFile(path string) (string, error) {
-	f, err := os.Open(path)
+func sha256HexFile(path string, allowedRoots []string) (string, error) {
+	resolved, err := validateMediaPath(path, allowedRoots)
 	if err != nil {
 		return "", err
 	}
-	defer f.Close()
-	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
+	f, err := os.Open(resolved)
+	if err != nil {
 		return "", err
+	}
+	h := sha256.New()
+	_, copyErr := io.Copy(h, f)
+	closeErr := f.Close()
+	if copyErr != nil {
+		return "", copyErr
+	}
+	if closeErr != nil {
+		return "", closeErr
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
@@ -192,7 +205,9 @@ func sshVerifySignature(message []byte, signature, principal, signersPath string
 	if err != nil {
 		return err
 	}
-	defer os.RemoveAll(tmp)
+	defer func() {
+		_ = os.RemoveAll(tmp)
+	}()
 	msgPath := filepath.Join(tmp, "payload")
 	sigPath := filepath.Join(tmp, "payload.sig")
 	if err := os.WriteFile(msgPath, message, 0o600); err != nil {
@@ -216,12 +231,25 @@ func sshVerifySignature(message []byte, signature, principal, signersPath string
 	return nil
 }
 
-func readCapabilitySidecar(path string) (*SendCapabilityFile, error) {
+func readCapabilitySidecar(path, capDir string) (*SendCapabilityFile, error) {
 	path = strings.TrimSpace(path)
 	if path == "" {
 		return nil, fmt.Errorf("send_capability_file required")
 	}
-	st, err := os.Stat(path)
+	if !filepath.IsAbs(path) {
+		return nil, fmt.Errorf("send_capability_file must be absolute")
+	}
+	resolvedDir, err := filepath.EvalSymlinks(capDir)
+	if err != nil {
+		return nil, fmt.Errorf("send_capability directory unavailable")
+	}
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil ||
+		(resolved != resolvedDir &&
+			!strings.HasPrefix(resolved, resolvedDir+string(os.PathSeparator))) {
+		return nil, fmt.Errorf("send_capability_file outside trusted directory")
+	}
+	st, err := os.Stat(resolved)
 	if err != nil {
 		return nil, fmt.Errorf("send_capability_file unreadable")
 	}
@@ -231,7 +259,7 @@ func readCapabilitySidecar(path string) (*SendCapabilityFile, error) {
 	if st.Mode().Perm()&0o077 != 0 {
 		return nil, fmt.Errorf("send_capability_file must be mode 0600")
 	}
-	raw, err := os.ReadFile(path)
+	raw, err := os.ReadFile(resolved)
 	if err != nil {
 		return nil, fmt.Errorf("send_capability_file unreadable")
 	}
@@ -354,7 +382,7 @@ func (v *SendCapVerifier) check(
 		return sendCapDecision{Allow: false, Reason: "send_capability_signers_unavailable"}
 	}
 
-	file, err := readCapabilitySidecar(capPath)
+	file, err := readCapabilitySidecar(capPath, v.capDir)
 	if err != nil {
 		return sendCapDecision{Allow: false, Reason: "send_capability_invalid: " + err.Error()}
 	}
@@ -407,7 +435,7 @@ func (v *SendCapVerifier) check(
 
 	wantMedia := ""
 	if strings.TrimSpace(mediaPath) != "" {
-		wantMedia, err = sha256HexFile(mediaPath)
+		wantMedia, err = sha256HexFile(mediaPath, v.mediaRoots)
 		if err != nil {
 			return sendCapDecision{Allow: false, Reason: "send_capability_media_unreadable"}
 		}
